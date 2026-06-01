@@ -143,6 +143,8 @@ class DataMasker:
 
     def _pd_build_numeric_map(self, col: str, series) -> dict:
         uniq = series.dropna().unique()
+        if len(uniq) == 0:
+            return {}
         if self.numeric_strategy == "tokenize":
             return {
                 v: int.from_bytes(self._hmac(col, v)[:8], "big") / 2**64
@@ -271,6 +273,8 @@ class DataMasker:
 
     def _pl_build_numeric_map(self, col: str, series) -> dict:
         uniq = series.drop_nulls().unique().to_list()
+        if len(uniq) == 0:
+            return {}
         if self.numeric_strategy == "tokenize":
             return {
                 v: int.from_bytes(self._hmac(col, v)[:8], "big") / 2**64
