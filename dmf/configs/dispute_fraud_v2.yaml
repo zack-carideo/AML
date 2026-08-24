@@ -110,7 +110,7 @@ preprocessing:
       enabled: true
       min_frequency: 0.005
       other_label: __RARE__
-    encoder: onehot                    # onehot | ordinal | woe | target  NOTE: run the framework over multiple config setups to evalute differnt approaches
+    encoder: woe                    # onehot | ordinal | woe | target  NOTE: run the framework over multiple config setups to evalute differnt approaches
     onehot:
       handle_unknown: infrequent_if_exist
       max_categories: null
