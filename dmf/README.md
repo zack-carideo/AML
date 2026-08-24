@@ -220,6 +220,15 @@ operating points), `brier_score`, `log_loss`, `calibration_error`.
   report asserts zero group leakage.
 - `time` — the holdout is the most recent slice; folds run forward only. The honest test
   for a model that will score next month, and the only one that exposes concept drift.
+- `group_time` — both at once (requires `group_column` *and* `time_column`). Each group's
+  **earliest** timestamp decides its side: the most recent `holdout_size` share of groups
+  — customers whose activity lies entirely in the newest window — becomes the holdout,
+  and any customer with earlier transactions stays whole in training. No customer ever
+  straddles the boundary. CV within training is `StratifiedGroupKFold`, so every fold
+  keeps groups intact too. Because spanners go to training, the holdout skews toward
+  short-tenure customers; the split report surfaces `median_rows_per_group_train` vs
+  `median_rows_per_group_holdout` so that skew is visible, alongside the zero-leakage
+  assertion and the train/holdout time periods.
 
 Group and time keys are automatically excluded from the candidate variables.
 
@@ -429,6 +438,14 @@ reproduces exactly the winning specification), and `model.joblib`.
 ---
 
 ## Provenance
+
+Built in the Claude (claude.ai) project **"fraud disputes"** (owner: zjc1002@gmail.com),
+August 2026. The project's doc `claude/modelling-framework.md` holds the living summary —
+decisions taken, validation performed, known gaps, and the pointer to the next phase (the
+GenAI analyst-explanation layer). To continue work with full context, open a session
+inside that project; a new session there reads that doc and can pick up where this left
+off.
+
 The chain of custody at runtime is separate and automatic: every training run records
 `run_lineage` (package versions, config SHA-256, data fingerprint) into `run_report.json`
 and into the `model.joblib` bundle, so any deployed model ties back to the exact code,

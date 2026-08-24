@@ -185,11 +185,43 @@ def test_time_split_trains_on_the_past_only(raw, tmp_path):
     assert "booked_at" not in res.report.get("candidate_variables")["numeric"]
 
 
+def test_group_time_split_is_group_intact_and_temporal(raw, tmp_path):
+    """Whole customers on one side; holdout = the most recently *arriving* groups."""
+    df = _split_frame(raw)
+    cfg = _split_cfg("group_time", tmp_path,
+                     group_column="customer_id", time_column="booked_at")
+    res = ModelSelectionHarness(cfg).run(df.copy())
+    sp = res.report.get("holdout_split")
+    assert sp["strategy"] == "group_time"
+    assert sp["n_groups_leaked"] == 0                        # no customer straddles
+    assert sp["n_groups_holdout"] == round(0.25 * (sp["n_groups_train"]
+                                                   + sp["n_groups_holdout"]))
+    assert "median_rows_per_group_holdout" in sp             # tenure skew surfaced
+    # every holdout group's FIRST transaction is at or after every training
+    # group's first transaction boundary: spanners went to training
+    first = df.groupby("customer_id")["booked_at"].min()
+    n_ho = sp["n_groups_holdout"]
+    expected_ho = set(first.sort_values(kind="mergesort").index[-n_ho:])
+    h = ModelSelectionHarness(cfg)
+    y = df["is_fraudulent_dispute"].astype(int).to_numpy()
+    X = df.drop(columns=["is_fraudulent_dispute"])
+    X_tr, X_ho, y_tr, _ = h._split(X, y)
+    assert set(X_ho["customer_id"]) == expected_ho
+    assert first[list(expected_ho)].min() >= first[first.index.difference(expected_ho)].max()
+    # CV within training keeps groups intact
+    g_tr = X_tr["customer_id"].to_numpy()
+    for tr, va in h._cv().split(X_tr, y_tr, h.groups_tr_):
+        assert not set(g_tr[tr]) & set(g_tr[va])
+
+
 def test_split_strategy_requires_its_key():
     with pytest.raises(ValueError, match="group_column"):
         Config.from_dict({"split": {"strategy": "group"}})
     with pytest.raises(ValueError, match="time_column"):
         Config.from_dict({"split": {"strategy": "time"}})
+    for missing in ({"group_column": "g"}, {"time_column": "t"}):
+        with pytest.raises(ValueError, match="group_time"):
+            Config.from_dict({"split": {"strategy": "group_time", **missing}})
 
 
 def test_tuning_inner_folds_differ_from_outer(raw, tmp_path):

@@ -63,54 +63,33 @@ columns:
   passthrough: []
   drop:
     - dispute_id
-
-  # AUTO_INFER SCOPE OVERVIEW   
-  # true -> type any undeclared column automatically 
-  # all columns are considered if this = True. columns in columns.drop are still ignored
-  # group_column and time_column are never considered as candidates). 
-  # candidates columns still go through 4 filters: quality gate(100% null, constant, 
-  # or identifier like with unique values above max_categorical_cardinality_ratio are removed 
-  # with reason reported). Note: auto-inference only types the UNDECLARED remainder of 
-  # columns so the columns you declare explicitly as numeric/categoric, are not overwritten.
-  auto_infer: false              
-
-  # Integer coded columns with unique values below this threshold are read as categorical 
-  # rather than numeric (since arithmetic on coded values is usually meaningless).      
+  auto_infer: false                    # true -> type any undeclared column automatically
+  auto_infer_max_cardinality: 25
   # a text column whose values parse at this rate is read as numeric or as a
   # date rather than becoming a high-cardinality categorical
-  auto_infer_max_cardinality: 25 
-
-  # share of a text column's non-null values that must parse cleanly as numbers 
-  # or dates for auto-inference to treat it as numeric/datetime instead of categorical
   numeric_parse_threshold: 0.95
-  
   # quality gates, applied only to columns the framework picks for itself
   drop_constant: true
-
-  # Categorical columns with unique values above this ratio are dropped
-  # Exception: if the column is explicitly declared in columns.categorical, it is kept
-  # regardless of cardinality, and high cardinality is then handled by the rare-level collapsing into __RARE__ instead of dropping
-  # NOTE: __rare__ just clumps all rare levels into one level, but does not consider the relationship between the rare levels and the target variable. If you want to do that, use target encoding instead of one-hot encoding.
-  max_categorical_cardinality_ratio: 0.5 
+  max_categorical_cardinality_ratio: 0.5
 
 preprocessing:
   numeric:
-    imputer: median                    # numeric imputation for missing values. if you use anything other than CONSTANT, then make sure add_missing_indicator = True, so that we can identify which records were imputed, and the model also has this available during training.
-    add_missing_indicator: true        # missingness is itself informative in disputes. if True, appends a binary missingindicator_<col> column for each numeric that had missing values in training. 
-    winsorize:                         # established during training, training thresholds used during inference
+    imputer: median
+    add_missing_indicator: true        # missingness is itself informative in disputes
+    winsorize:
       enabled: true
       lower_quantile: 0.005
       upper_quantile: 0.995
-    scaler: standard                   # auto-disabled for models with requires_scaling: false ,  only logistic actually needs scaling, but it is a good idea to keep the numeric features on a similar scale for tree-based models as well.
-    variance_threshold: null           # optional last step in numeric branch that drops encoded columlns whose training_variance < threshold. it operates AFTER encoding, per fold -where new newar-constants appear that role inference cant see (e.g a missing indicator thats 99% 0, or a column that happens to be constant within one CV fold training split). Do not use in production, only use if absolutly required during model selection to reduce dimensionality. If you use this, make sure to set the threshold low enough that you dont drop any columns that are actually informative.
+    scaler: standard                   # auto-disabled for models with requires_scaling: false
+    variance_threshold: null
   categorical:
-    imputer: constant                  # leave this, ensures information from missing is captured during WOE binning. if set to most_frequent all missing values are merged into the marjority level, highly likley to create noise. NOTE on Ordering: imputation runs before rarae-level collapsing  
+    imputer: constant
     imputer_fill_value: __MISSING__
     rare_level:
       enabled: true
       min_frequency: 0.005
       other_label: __RARE__
-    encoder: onehot                    # onehot | ordinal | woe | target  NOTE: run the framework over multiple config setups to evalute differnt approaches
+    encoder: onehot                    # onehot | ordinal | woe | target
     onehot:
       handle_unknown: infrequent_if_exist
       max_categories: null
@@ -133,7 +112,7 @@ preprocessing:
     coerce_numeric: true               # text in a numeric column -> missing, flagged
     unseen_category_policy: sentinel   # sentinel | nan | error
     unseen_label: __UNSEEN__
-    missing_column_policy: fill        # fill = treat as missing and impute, flagged , set to error to hard fail if a column  used for inferencing is missing (NOTE: if a column is present but is all NULL, it will not fail, it will fill with training median, and flag all rows as missing the value, use post-scoring reporting to account for)
+    missing_column_policy: fill        # fill = treat as missing and impute, flagged
     max_guarded_rate: 0.05             # batch marked 'review_recommended' above this
     warn: true
 
@@ -190,7 +169,7 @@ selection:
   # false -> the 3 best (model, k) cells outright, which may all be one model.
   # true  -> the best variant of 3 different architectures, which is usually
   #          what a champion/challenger review wants to see.
-  top_n_distinct_models: true
+  top_n_distinct_models: false
   one_se_rule: true                    # prefer the simplest model within 1 SE of the best
   marginal_gain_test: paired_t         # paired_t (Nadeau-Bengio corrected) | wilcoxon | none
 

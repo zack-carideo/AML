@@ -244,9 +244,14 @@ class SplitConfig:
     # time   -- the holdout is the most recent slice, and CV folds run forward
     #           only. The honest test for a fraud model that will score the
     #           future, and the only one that exposes concept drift.
-    strategy: str = "random"               # random | group | time
-    group_column: Optional[str] = None     # required for strategy: group
-    time_column: Optional[str] = None      # required for strategy: time
+    # group_time -- both at once: each group's *earliest* timestamp decides its
+    #           side, so the holdout is the most recent share of groups whose
+    #           activity lies entirely in the newest window, and any group with
+    #           earlier transactions stays whole in training. CV within
+    #           training is group-intact (StratifiedGroupKFold).
+    strategy: str = "random"               # random | group | time | group_time
+    group_column: Optional[str] = None     # required for strategy: group, group_time
+    time_column: Optional[str] = None      # required for strategy: time, group_time
     cv: CVConfig = field(default_factory=CVConfig)
 
 
@@ -405,7 +410,7 @@ class Config:
             (self.selection.marginal_gain_test, {"wilcoxon", "paired_t", "none"}, "selection.marginal_gain_test"),
             (self.tuning.strategy, {"random", "grid"}, "tuning.strategy"),
             (self.tuning.apply_to, {"top_n", "all"}, "tuning.apply_to"),
-            (self.split.strategy, {"random", "group", "time"}, "split.strategy"),
+            (self.split.strategy, {"random", "group", "time", "group_time"}, "split.strategy"),
         ]:
             _check_in(value, allowed, where)
         if g.numeric_tolerance < 0:
@@ -424,10 +429,10 @@ class Config:
                 "tuning.cv_splits must differ from split.cv.n_splits when "
                 "split.strategy='time', or inner and outer folds coincide."
             )
-        if self.split.strategy == "group" and not self.split.group_column:
-            raise ValueError("split.strategy='group' requires split.group_column.")
-        if self.split.strategy == "time" and not self.split.time_column:
-            raise ValueError("split.strategy='time' requires split.time_column.")
+        if self.split.strategy in ("group", "group_time") and not self.split.group_column:
+            raise ValueError(f"split.strategy='{self.split.strategy}' requires split.group_column.")
+        if self.split.strategy in ("time", "group_time") and not self.split.time_column:
+            raise ValueError(f"split.strategy='{self.split.strategy}' requires split.time_column.")
         if not 0.0 < self.split.holdout_size < 1.0:
             raise ValueError("split.holdout_size must be in (0, 1).")
         if self.split.cv.n_splits < 2:

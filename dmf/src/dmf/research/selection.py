@@ -231,6 +231,17 @@ class ModelSelectionHarness:
             splitter = GroupShuffleSplit(n_splits=1, test_size=cfg.split.holdout_size,
                                          random_state=cfg.run.random_state)
             tr_idx, ho_idx = next(splitter.split(X, y, groups=groups))
+        elif strategy == "group_time":
+            # A group's side is decided by its *earliest* timestamp: the most
+            # recent holdout_size share of groups (all activity inside the
+            # newest window) becomes the holdout; any group with transactions
+            # before that window stays whole in training. No group straddles.
+            t = self._series(X, cfg.split.time_column)
+            first_seen = t.groupby(groups.to_numpy()).min().sort_values(kind="mergesort")
+            n_ho = max(1, int(round(len(first_seen) * cfg.split.holdout_size)))
+            ho_groups = set(first_seen.index[-n_ho:])
+            mask = groups.isin(ho_groups).to_numpy()
+            tr_idx, ho_idx = np.flatnonzero(~mask), np.flatnonzero(mask)
         else:
             tr_idx, ho_idx = train_test_split(
                 np.arange(len(X)),
@@ -245,16 +256,23 @@ class ModelSelectionHarness:
         self.groups_tr_ = None if groups is None else groups.iloc[tr_idx].to_numpy()
 
         extra: Dict[str, Any] = {}
-        if strategy == "group":
+        if strategy in ("group", "group_time"):
             g_tr, g_ho = set(groups.iloc[tr_idx]), set(groups.iloc[ho_idx])
             extra.update(group_column=cfg.split.group_column,
                          n_groups_train=len(g_tr), n_groups_holdout=len(g_ho),
                          n_groups_leaked=len(g_tr & g_ho))
-        elif strategy == "time":
+        if strategy in ("time", "group_time"):
             t = self._series(X, cfg.split.time_column)
             extra.update(time_column=cfg.split.time_column,
                          train_period=[str(t.iloc[tr_idx].min()), str(t.iloc[tr_idx].max())],
                          holdout_period=[str(t.iloc[ho_idx].min()), str(t.iloc[ho_idx].max())])
+        if strategy == "group_time":
+            # spanners go to training, so the holdout skews toward short-tenure
+            # groups; surface that skew rather than leaving it implicit
+            extra.update(median_rows_per_group_train=float(np.median(np.bincount(
+                             pd.factorize(groups.iloc[tr_idx])[0]))),
+                         median_rows_per_group_holdout=float(np.median(np.bincount(
+                             pd.factorize(groups.iloc[ho_idx])[0]))))
 
         self.report.add(
             "holdout_split",
@@ -307,6 +325,9 @@ class ModelSelectionHarness:
         the fitting and the scoring half of a fold.
         ``time``  -> TimeSeriesSplit on time-ordered rows: every fold trains on
         the past and scores the future, which is how the model will be used.
+        ``group_time`` -> StratifiedGroupKFold as well: the temporal guarantee
+        already lives in the holdout assignment, and within training the
+        binding requirement is that every group stays whole in each fold.
 
         ``n_splits`` / ``seed_offset`` exist for the *inner* tuning loop, which
         must not reproduce the outer folds: hyper-parameters selected on the
@@ -318,7 +339,7 @@ class ModelSelectionHarness:
         cv_cfg = cfg.split.cv
         n = n_splits or cv_cfg.n_splits
         seed = cfg.run.random_state + seed_offset
-        if cfg.split.strategy == "group":
+        if cfg.split.strategy in ("group", "group_time"):
             return StratifiedGroupKFold(n_splits=n, shuffle=cv_cfg.shuffle,
                                         random_state=seed if cv_cfg.shuffle else None)
         if cfg.split.strategy == "time":
