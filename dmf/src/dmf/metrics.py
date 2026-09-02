@@ -135,6 +135,29 @@ def make_scorers(metrics_cfg: Any) -> Dict[str, Any]:
     return scorers
 
 
+def score_vector(y_true, y_score, metrics_cfg: Any, signed: bool = False) -> Dict[str, float]:
+    """Every configured metric computed from one probability vector.
+
+    ``signed=True`` reproduces the sklearn scorer convention (loss-type metrics
+    negated), so values are interchangeable with what ``make_scorers`` produces
+    inside ``cross_validate`` -- the harness computes ``predict_proba`` once and
+    derives all metrics from it instead of re-predicting once per scorer.
+    A metric that cannot be computed on a fold is missing, not zero.
+    """
+    names = [metrics_cfg.primary] + [m for m in metrics_cfg.secondary if m != metrics_cfg.primary]
+    out: Dict[str, float] = {}
+    for name in names:
+        spec = METRIC_REGISTRY[name]
+        try:
+            v = float(spec.fn(y_true, y_score, **_kwargs_for(name, metrics_cfg)))
+        except Exception:
+            v = float("nan")
+        if signed and not spec.greater_is_better and np.isfinite(v):
+            v = -v
+        out[name] = v
+    return out
+
+
 def orient(name: str, value: float) -> float:
     """Convert a signed sklearn CV score back to its natural units."""
     if name in METRIC_REGISTRY and not METRIC_REGISTRY[name].greater_is_better:
@@ -239,7 +262,7 @@ def psi_band(psi: float) -> str:
 
 __all__ = [
     "METRIC_REGISTRY", "make_scorers", "orient", "greater_is_better",
-    "evaluate_predictions", "decile_table",
+    "evaluate_predictions", "score_vector", "decile_table",
     "population_stability_index", "psi_band",
     "ks_statistic", "recall_at_fpr", "lift_at_top_pct", "expected_calibration_error",
 ]

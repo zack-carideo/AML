@@ -13,6 +13,15 @@ via :func:`dmf.pipeline.build_model_pipeline`.
 """
 
 from .api import score, train
+from .evaluate import (
+    PredictionLog,
+    compute_metrics,
+    implied_thresholds,
+    load_fold_assignments,
+    load_predictions,
+    operating_point_table,
+    threshold_at_fpr,
+)
 from .ordering import aggregate_to_source, importance_ordering, rank_variables, rfe_ordering
 from .selection import ModelSelectionHarness, SelectionResult
 from .sweep import check_comparability, run_sweep
@@ -25,6 +34,13 @@ __all__ = [
     "score",
     "run_sweep",
     "check_comparability",
+    "PredictionLog",
+    "load_predictions",
+    "load_fold_assignments",
+    "compute_metrics",
+    "threshold_at_fpr",
+    "operating_point_table",
+    "implied_thresholds",
     "rank_variables",
     "importance_ordering",
     "rfe_ordering",

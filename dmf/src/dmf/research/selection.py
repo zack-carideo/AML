@@ -42,7 +42,6 @@ from sklearn.model_selection import (
     StratifiedGroupKFold,
     StratifiedKFold,
     TimeSeriesSplit,
-    cross_validate,
     train_test_split,
 )
 
@@ -53,10 +52,12 @@ from ..metrics import (
     greater_is_better,
     make_scorers,
     orient,
+    score_vector,
 )
 from ..pipeline import DisputeFeaturePipeline, build_model_pipeline
 from ..reporting import StepReport, json_safe, run_lineage, summarize_frame, summarize_target
 from ..transformers import infer_roles
+from .evaluate import PredictionLog, implied_thresholds, write_prediction_artifacts
 from .ordering import rank_variables
 from .zoo import build_estimator, config_for_model
 
@@ -78,6 +79,10 @@ class SelectionResult:
     feature_report: Dict[str, Any] = field(default_factory=dict)
     report: Optional[StepReport] = None
     config: Optional[Config] = None
+    # row-level (row_id, y_true, y_score) for every stage run.save_predictions
+    # captured, plus the CV fold-membership map -- see dmf.research.evaluate
+    predictions: Optional[pd.DataFrame] = None
+    fold_assignments: Optional[pd.DataFrame] = None
 
     @property
     def selected_features(self) -> List[str]:
@@ -99,6 +104,12 @@ class ModelSelectionHarness:
         self.report = StepReport(run=config.run.name)
         self.groups_tr_: Optional[np.ndarray] = None
         self._orderings_cache: Dict[str, Any] = {}
+        self.predictions_ = PredictionLog(config.run.save_predictions)
+        self.row_ids_: Optional[np.ndarray] = None
+        self.row_ids_tr_: Optional[np.ndarray] = None
+        self.row_ids_ho_: Optional[np.ndarray] = None
+        self.positive_label_: Any = None
+        self._row_id_source: str = "dataframe_index"
 
     # ------------------------------------------------------------------
     # public entry point
@@ -141,6 +152,8 @@ class ModelSelectionHarness:
             feature_report=feat_report,
             report=self.report,
             config=cfg,
+            predictions=self.predictions_.to_frame() if self.predictions_.enabled else None,
+            fold_assignments=self.predictions_.fold_frame() if self.predictions_.enabled else None,
         )
         self._write_artifacts(result)
         if cfg.run.verbose:
@@ -169,6 +182,23 @@ class ModelSelectionHarness:
             y_ser = pd.Series(np.asarray(y).ravel(), index=frame.index)
 
         y_arr, positive_label = _binarize_target(y_ser, cfg.data.positive_label)
+        self.positive_label_ = positive_label
+
+        # resolve the row identity that keys the prediction store, before
+        # sampling so the positional subset below keeps ids aligned
+        id_col = cfg.data.id_column
+        if id_col:
+            if id_col not in frame.columns:
+                raise KeyError(
+                    f"data.id_column='{id_col}' is not present in the data. "
+                    f"Unset it to fall back to the DataFrame index."
+                )
+            row_ids = frame[id_col].to_numpy()
+            frame = frame.drop(columns=[id_col])   # an identifier is never a feature
+            self._row_id_source = f"data.id_column:{id_col}"
+        else:
+            row_ids = frame.index.to_numpy()
+            self._row_id_source = "dataframe_index"
 
         if cfg.data.sample_frac:
             # sample positions, not labels: frame.index holds labels while y_arr
@@ -180,8 +210,9 @@ class ModelSelectionHarness:
                     replace=False,
                 )
             )
-            frame, y_arr = frame.iloc[keep], y_arr[keep]
+            frame, y_arr, row_ids = frame.iloc[keep], y_arr[keep], row_ids[keep]
 
+        self.row_ids_ = row_ids
         drop = [c for c in cfg.columns.drop if c in frame.columns]
         if drop:
             frame = frame.drop(columns=drop)
@@ -254,6 +285,11 @@ class ModelSelectionHarness:
         X_tr, X_ho = X.iloc[tr_idx], X.iloc[ho_idx]
         y_tr, y_ho = y[tr_idx], y[ho_idx]
         self.groups_tr_ = None if groups is None else groups.iloc[tr_idx].to_numpy()
+        # _split is also exercised directly (tests, notebooks) without _load
+        # having resolved row identity first; fall back to the frame's index
+        if self.row_ids_ is None:
+            self.row_ids_ = X.index.to_numpy()
+        self.row_ids_tr_, self.row_ids_ho_ = self.row_ids_[tr_idx], self.row_ids_[ho_idx]
 
         extra: Dict[str, Any] = {}
         if strategy in ("group", "group_time"):
@@ -482,7 +518,6 @@ class ModelSelectionHarness:
         a direct measure of how stable the selection is. That is reported.
         """
         cfg = self.config
-        scorers = make_scorers(cfg.metrics)
         primary = cfg.metrics.primary
         ks = self._k_values(len(candidates))
         k_cap = max(ks)
@@ -491,10 +526,13 @@ class ModelSelectionHarness:
         stability: Dict[str, Dict[str, int]] = {m: {} for m in zoo}
         n_folds = 0
 
-        for tr_idx, va_idx in cv.split(X_tr, y_tr, self.groups_tr_):
+        for f, (tr_idx, va_idx) in enumerate(cv.split(X_tr, y_tr, self.groups_tr_)):
             n_folds += 1
+            repeat, fold = divmod(f, cfg.split.cv.n_splits)
             Xf, yf = X_tr.iloc[tr_idx], y_tr[tr_idx]
             Xv, yv = X_tr.iloc[va_idx], y_tr[va_idx]
+            ids_f, ids_v = self.row_ids_tr_[tr_idx], self.row_ids_tr_[va_idx]
+            self.predictions_.add_fold(fold, repeat, ids_v)
 
             for model_name, entry in zoo.items():
                 fold_order, _ = rank_variables(
@@ -506,23 +544,8 @@ class ModelSelectionHarness:
                 for k in ks:
                     cell = cells.setdefault((model_name, k), {"fit_time": []})
                     pipe = build_model_pipeline(entry["config"], fold_order[:k], entry["estimator"])
-                    t = time.time()
-                    try:
-                        pipe.fit(Xf, yf)
-                    except Exception:      # a failed cell must not abort the sweep
-                        for name in scorers:
-                            cell.setdefault(f"test_{name}", []).append(np.nan)
-                            if cfg.metrics.compute_train_scores:
-                                cell.setdefault(f"train_{name}", []).append(np.nan)
-                        cell["fit_time"].append(np.nan)
-                        continue
-                    cell["fit_time"].append(time.time() - t)
-                    for name, scorer in scorers.items():
-                        cell.setdefault(f"test_{name}", []).append(_safe_score(scorer, pipe, Xv, yv))
-                        if cfg.metrics.compute_train_scores:
-                            cell.setdefault(f"train_{name}", []).append(
-                                _safe_score(scorer, pipe, Xf, yf)
-                            )
+                    self._score_cell(cell, pipe, Xf, yf, Xv, yv, ids_f, ids_v,
+                                     model_name, k, fold, repeat)
 
         # the reported variable list is the one the full training partition
         # chooses; the *score* beside it is the nested estimate above
@@ -554,6 +577,48 @@ class ModelSelectionHarness:
             },
         )
         return rows, fold_scores
+
+    def _score_cell(self, cell, pipe, Xf, yf, Xv, yv, ids_f, ids_v,
+                    model_name, k, fold, repeat) -> None:
+        """Fit one grid cell on one fold and score it from a single prediction.
+
+        ``predict_proba`` runs once per partition and every configured metric
+        is derived from that vector (in the sklearn signed-scorer convention,
+        so downstream ``orient`` calls are unchanged). The same vector feeds
+        the prediction store, which is what makes every leaderboard number
+        recomputable from the stored rows, bit for bit.
+        """
+        cfg = self.config
+        names = [cfg.metrics.primary] + [m for m in cfg.metrics.secondary
+                                         if m != cfg.metrics.primary]
+        t = time.time()
+        try:
+            pipe.fit(Xf, yf)
+        except Exception:      # a failed cell must not abort the sweep
+            for name in names:
+                cell.setdefault(f"test_{name}", []).append(np.nan)
+                if cfg.metrics.compute_train_scores:
+                    cell.setdefault(f"train_{name}", []).append(np.nan)
+            cell["fit_time"].append(np.nan)
+            return
+        cell["fit_time"].append(time.time() - t)
+
+        proba_v = _safe_proba(pipe, Xv)
+        test = score_vector(yv, proba_v, cfg.metrics, signed=True) if proba_v is not None else {}
+        for name in names:
+            cell.setdefault(f"test_{name}", []).append(test.get(name, np.nan))
+        if proba_v is not None:
+            self.predictions_.add("cv", model_name, k, fold, repeat, ids_v, yv, proba_v)
+
+        if cfg.metrics.compute_train_scores or self.predictions_.wants("cv_train"):
+            proba_f = _safe_proba(pipe, Xf)
+            if cfg.metrics.compute_train_scores:
+                train = (score_vector(yf, proba_f, cfg.metrics, signed=True)
+                         if proba_f is not None else {})
+                for name in names:
+                    cell.setdefault(f"train_{name}", []).append(train.get(name, np.nan))
+            if proba_f is not None:
+                self.predictions_.add("cv_train", model_name, k, fold, repeat, ids_f, yf, proba_f)
 
     def _row_from_cv(self, model_name, spec: ModelSpec, k, features, cvres, primary) -> Dict[str, Any]:
         cfg = self.config
@@ -763,13 +828,14 @@ class ModelSelectionHarness:
             search.fit(X_tr, y_tr, groups=self.groups_tr_)
 
             tuned_est = search.best_estimator_.named_steps["model"]
-            tuned_pipe = build_model_pipeline(entry["config"], features, tuned_est)
-            cvres = cross_validate(tuned_pipe, X_tr, y_tr, groups=self.groups_tr_,
-                                   scoring=scorers, cv=outer,
-                                   n_jobs=cfg.run.n_jobs,
-                                   return_train_score=cfg.metrics.compute_train_scores,
-                                   error_score=np.nan)
             tuned_name = f"{model_name}__tuned"
+            # scored through the same fold loop as the grid, so tuned rows are
+            # computed identically to their baselines and their fold-level
+            # predictions land in the store like any other cv cell
+            cvres = self._outer_cv_scores(
+                lambda: build_model_pipeline(entry["config"], features, tuned_est),
+                X_tr, y_tr, outer, tuned_name, k,
+            )
             spec_copy = ModelSpec(**{**entry["spec"].__dict__, "tag": f"{entry['spec'].tag}+tuned"})
             new_rows.append(self._row_from_cv(tuned_name, spec_copy, k, features, cvres, primary))
             fold_scores[(tuned_name, k)] = np.asarray(
@@ -804,6 +870,23 @@ class ModelSelectionHarness:
         )
         return leaderboard, fold_scores, zoo
 
+    def _outer_cv_scores(self, make_pipe, X_tr, y_tr, cv, model_name, k) -> Dict[str, np.ndarray]:
+        """``cross_validate`` substitute for a fixed specification.
+
+        Runs the same fold iteration and the same scoring path as the grid
+        (:meth:`_score_cell`), returning arrays shaped like ``cross_validate``'s
+        output so :meth:`_row_from_cv` consumes either interchangeably.
+        """
+        cell: Dict[str, List[float]] = {"fit_time": []}
+        for f, (tr_idx, va_idx) in enumerate(cv.split(X_tr, y_tr, self.groups_tr_)):
+            repeat, fold = divmod(f, self.config.split.cv.n_splits)
+            self._score_cell(cell, make_pipe(),
+                             X_tr.iloc[tr_idx], y_tr[tr_idx],
+                             X_tr.iloc[va_idx], y_tr[va_idx],
+                             self.row_ids_tr_[tr_idx], self.row_ids_tr_[va_idx],
+                             model_name, k, fold, repeat)
+        return {key: np.asarray(vals, dtype=float) for key, vals in cell.items()}
+
     # ------------------------------------------------------------------
     # step 7: holdout confirmation + production refit
     # ------------------------------------------------------------------
@@ -817,6 +900,14 @@ class ModelSelectionHarness:
         proba = pipe.predict_proba(X_ho)[:, 1]
         holdout = evaluate_predictions(y_ho, proba, cfg.metrics)
         deciles = decile_table(y_ho, proba)
+        # the operating thresholds implied by the champion's holdout scores;
+        # decision_threshold ships in the model bundle so ProductionScorer
+        # applies a stable absolute cut instead of a batch-relative quantile.
+        # (Computed on the train-only fit's holdout scores: the full-data refit
+        # below saw the holdout labels, so its own holdout scores are tainted.)
+        holdout.update(implied_thresholds(y_ho, proba, cfg.metrics))
+        self.predictions_.add("holdout", selected["model"], selected["k"], None, None,
+                              self.row_ids_ho_, y_ho, proba)
         # the reference distribution PSI needs in production; without it the
         # monitoring helper cannot run without reloading the training table
         holdout["reference_score_quantiles"] = [
@@ -935,6 +1026,34 @@ class ModelSelectionHarness:
         }
         for name, payload in blobs.items():
             (out / name).write_text(json.dumps(json_safe(payload), indent=2))
+
+        lineage = self.report.get("lineage") or {}
+        written = write_prediction_artifacts(out, self.predictions_, meta={
+            "run": cfg.run.name,
+            "created_by": "dmf.research.selection.ModelSelectionHarness",
+            "config_sha256": lineage.get("config_sha256"),
+            "data_sha256": lineage.get("data_sha256"),
+            "row_id_source": self._row_id_source,
+            "positive_label": str(self.positive_label_),
+            "score_semantics": "y_score is predict_proba[:, 1] for the positive label; "
+                               "y_true is 1 where the raw target equals positive_label",
+            "selected_model": result.selected_model,
+            "selected_k": result.selected.get("k"),
+            "cv": {"strategy": cfg.split.strategy, "n_splits": cfg.split.cv.n_splits,
+                   "n_repeats": cfg.split.cv.n_repeats},
+            "metrics": cfg.to_dict()["metrics"],
+            "decision_threshold": result.holdout_metrics.get("decision_threshold"),
+            "decision_threshold_policy": result.holdout_metrics.get("decision_threshold_policy"),
+            "implied_threshold_top_pct": result.holdout_metrics.get("implied_threshold_top_pct"),
+            "implied_threshold_at_fpr": result.holdout_metrics.get("implied_threshold_at_fpr"),
+        })
+        if written:
+            self.report.add(
+                "prediction_store",
+                level=cfg.run.save_predictions,
+                rows_per_stage=self.predictions_.stage_counts(),
+                files=sorted(written.values()),
+            )
         self.report.to_json(str(out / "run_report.json"))
 
         # a config that reproduces exactly the winning specification
@@ -965,9 +1084,14 @@ class ModelSelectionHarness:
                      "model": result.selected_model,
                      "config": cfg.to_dict(),
                      "dmf_version": __version__,
-                     # set this offline once a cost-based threshold has been
-                     # tuned; until then the scorer falls back to a relative cut
-                     "decision_threshold": None,
+                     # derived from the champion's holdout score distribution
+                     # per metrics.decision_threshold_policy; ProductionScorer
+                     # picks it up on load. None only when the policy is 'none'
+                     # (or the holdout was degenerate) -- the scorer then falls
+                     # back to a batch-relative cut.
+                     "decision_threshold": result.holdout_metrics.get("decision_threshold"),
+                     "decision_threshold_policy": result.holdout_metrics.get(
+                         "decision_threshold_policy"),
                      # reference distribution for PSI monitoring, so drift can be
                      # measured in production without reloading the training table
                      "reference_score_quantiles": result.holdout_metrics.get(
@@ -985,12 +1109,13 @@ class ModelSelectionHarness:
 # --------------------------------------------------------------------------
 # statistics helpers
 # --------------------------------------------------------------------------
-def _safe_score(scorer, estimator, X, y) -> float:
-    """A metric that cannot be computed on a fold is missing, not zero."""
+def _safe_proba(pipe, X) -> Optional[np.ndarray]:
+    """Positive-class probabilities, or None when prediction itself fails --
+    the caller records NaN scores and stores no rows for that fold."""
     try:
-        return float(scorer(estimator, X, y))
+        return np.asarray(pipe.predict_proba(X))[:, 1]
     except Exception:
-        return float("nan")
+        return None
 
 
 def _binarize_target(y: pd.Series, positive_label: Any) -> Tuple[np.ndarray, Any]:

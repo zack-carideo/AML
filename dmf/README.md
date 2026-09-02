@@ -239,6 +239,49 @@ architecture*; tuning is a later, separate question. When enabled it searches on
 CV split and the tuned specification is then re-scored on the same outer CV as everything
 else, so the leaderboard stays comparable.
 
+### The prediction store
+
+Every score the harness computes is also *storable*: `run.save_predictions` writes a
+long-format `predictions.parquet` under the run directory holding
+`(row_id, y_true, y_score)` plus provenance (`stage`, `model`, `k`, `fold`, `repeat`),
+alongside `fold_assignments.parquet` (which rows formed each CV validation fold) and a
+`predictions_meta.json` sidecar recording what the numbers mean — the resolved positive
+label, the score semantics, the metric operating points, and the derived decision
+threshold. Levels are cumulative: `none` | `holdout` (default) | `cv` (every validation
+fold of every model × k cell) | `all` (adds the training-side fold predictions for
+row-level overfit work). `data.id_column` names the record identifier; unset, the
+DataFrame index is used.
+
+Raw scores are stored instead of predicted labels on purpose: a label is
+`score >= threshold` for some threshold, and selection has none — every metric either
+integrates over all thresholds or fixes an operating point (an FPR, a review budget) and
+lets the threshold fall out. Stored scores keep every operating point available forever.
+
+From the store, `dmf.research` recomputes anything post-run, with no model and no raw
+data:
+
+```python
+from dmf.research import (load_predictions, compute_metrics,
+                          threshold_at_fpr, operating_point_table)
+
+preds, meta = load_predictions("artifacts/my_run")
+compute_metrics(preds, meta, by=["stage", "model", "k"])        # reproduces the leaderboard
+compute_metrics(preds, meta, by=["model", "k", "fold"])         # per-fold breakdown
+threshold_at_fpr(preds, max_fpr=0.01, by=["model", "k", "fold"])  # implied cut + stability
+operating_point_table(preds[preds.stage == "holdout"])          # precision/recall/flag-rate per cut
+```
+
+`compute_metrics` runs through the same registry as the harness, so recomputed numbers
+reproduce the leaderboard and holdout report exactly — and any metric added to
+`dmf.metrics` later works on old runs. The same rows also feed calibration curves, slice
+analyses on any column (join on `row_id`), and PSI between folds.
+
+The champion's **decision threshold** is derived automatically from its holdout score
+distribution per `metrics.decision_threshold_policy` — `top_pct` (the cut flagging the
+top `lift_top_pct` of volume; default), `fpr` (the cut achieving `recall_at_fpr`
+false-positive rate), or `none` — and ships in `model.joblib` as `decision_threshold`,
+which `ProductionScorer.from_joblib` picks up as a stable absolute cut.
+
 ---
 
 ## Production inference
@@ -300,11 +343,14 @@ record with no exception anywhere.
 Two things belong after model selection and are one call each. They are left out because
 their right configuration is a business decision that should not be frozen in code.
 
-**Threshold tuning.** `result.fitted_model` is a plain sklearn `Pipeline`, so
-`TunedThresholdClassifierCV` wraps it directly. Score it with a *hard-label* objective —
-a cost function encoding what a missed fraudulent dispute costs versus an analyst review
-plus a false accusation — not with `average_precision`, which is threshold-free and would
-give a flat surface. Carry the resulting float into `ProductionScorer(threshold=...)`.
+**Threshold tuning.** The bundle already ships a capacity- or FPR-based
+`decision_threshold` derived from the holdout (see *The prediction store*), which is the
+right starting point. A *cost-based* refinement stays post-hoc: `result.fitted_model` is
+a plain sklearn `Pipeline`, so `TunedThresholdClassifierCV` wraps it directly. Score it
+with a *hard-label* objective — a cost function encoding what a missed fraudulent dispute
+costs versus an analyst review plus a false accusation — not with `average_precision`,
+which is threshold-free and would give a flat surface. Carry the resulting float into
+`ProductionScorer(threshold=...)`, which overrides the bundled cut.
 
 **Probability calibration.** `CalibratedClassifierCV` wraps the same pipeline. The
 holdout report already tells you whether you need it (`calibration_ratio`,
@@ -433,7 +479,9 @@ name from `dmf` raises an `ImportError` that names its new home in `dmf.research
 `leaderboard.csv`, `marginal_gains.csv`, `best_per_model.csv`, `holdout_deciles.csv`,
 `orderings.json`, `top_specs.json`, `selected_spec.json`, `holdout_metrics.json`,
 `feature_pipeline_report.json`, `run_report.json`, `final_spec.yaml` (a config that
-reproduces exactly the winning specification), and `model.joblib`.
+reproduces exactly the winning specification), `model.joblib`, and — per
+`run.save_predictions` — the prediction store: `predictions.parquet`,
+`fold_assignments.parquet`, `predictions_meta.json`.
 
 ---
 

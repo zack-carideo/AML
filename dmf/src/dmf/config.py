@@ -102,6 +102,15 @@ class RunConfig:
     # after the holdout has been scored, refit the winning specification on
     # train + holdout so the shipped model uses all available data
     refit_on_full_data: bool = True
+    # row-level prediction store written under the run's artifact directory,
+    # so any metric can be recomputed post-run without refitting anything.
+    # Levels are cumulative:
+    #   none    -- store nothing
+    #   holdout -- the champion's holdout predictions (cheap; the default)
+    #   cv      -- + every validation-fold prediction of every model x k cell
+    #   all     -- + the training-side predictions of each CV fold (largest;
+    #              enables row-level overfit diagnostics)
+    save_predictions: str = "holdout"
 
 
 @dataclass
@@ -109,6 +118,10 @@ class DataConfig:
     path: Optional[str] = None
     format: str = "csv"                    # csv | parquet
     target: str = "target"
+    # column that uniquely identifies a record (dispute id, claim id, ...).
+    # Used to key the prediction store; never used as a model feature. When
+    # unset, the DataFrame index is recorded instead.
+    id_column: Optional[str] = None
     positive_label: Any = 1
     sample_frac: Optional[float] = None
     read_kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -271,6 +284,16 @@ class MetricsConfig:
     recall_at_fpr: float = 0.01            # operating point for recall_at_fpr
     lift_top_pct: float = 0.05             # review-budget for lift_at_top_pct
     compute_train_scores: bool = True      # enables the overfit-gap diagnostic
+    # how the champion's production decision threshold is derived from its
+    # holdout score distribution (saved into the model bundle so the
+    # ProductionScorer picks it up):
+    #   top_pct -- the score cut that flags the top lift_top_pct of holdout
+    #              volume (capacity-based; mirrors the scorer's top_pct fallback
+    #              but as a stable absolute number)
+    #   fpr     -- the score cut that achieves recall_at_fpr false-positive
+    #              rate on the holdout
+    #   none    -- do not derive one; the bundle ships decision_threshold=null
+    decision_threshold_policy: str = "top_pct"
     # columns to break the holdout report down by (claim channel, reason code,
     # segment, ...). They need only exist in the data -- they do not have to be
     # model inputs -- so flag-rate parity can be checked on attributes the
@@ -411,6 +434,9 @@ class Config:
             (self.tuning.strategy, {"random", "grid"}, "tuning.strategy"),
             (self.tuning.apply_to, {"top_n", "all"}, "tuning.apply_to"),
             (self.split.strategy, {"random", "group", "time", "group_time"}, "split.strategy"),
+            (self.run.save_predictions, {"none", "holdout", "cv", "all"}, "run.save_predictions"),
+            (self.metrics.decision_threshold_policy, {"top_pct", "fpr", "none"},
+             "metrics.decision_threshold_policy"),
         ]:
             _check_in(value, allowed, where)
         if g.numeric_tolerance < 0:
