@@ -32,6 +32,33 @@ from sklearn.metrics import (
 # --------------------------------------------------------------------------
 # metric functions (y_true, y_score) -> float
 # --------------------------------------------------------------------------
+def _has_both_classes(y_true) -> bool:
+    """A ranking metric is undefined unless both classes are present.
+
+    sklearn disagrees with itself here: ``roc_auc_score`` raises on a
+    single-class target, while ``average_precision_score`` warns and returns
+    0.0 -- which then lands in a report as if a model had scored terribly on
+    a segment where nothing was measurable. Every discrimination metric in the
+    registry runs this check first and returns NaN, which the reporting layer
+    renders as null.
+    """
+    return len(np.unique(np.asarray(y_true).ravel())) >= 2
+
+
+def average_precision(y_true, y_score) -> float:
+    """PR-AUC; NaN rather than sklearn's 0.0 when ``y_true`` has no positives."""
+    if not _has_both_classes(y_true):
+        return float("nan")
+    return float(average_precision_score(y_true, y_score))
+
+
+def roc_auc(y_true, y_score) -> float:
+    """ROC-AUC; NaN rather than an exception when ``y_true`` is single-class."""
+    if not _has_both_classes(y_true):
+        return float("nan")
+    return float(roc_auc_score(y_true, y_score))
+
+
 def ks_statistic(y_true, y_score) -> float:
     """Kolmogorov-Smirnov separation: max(TPR - FPR) over all thresholds."""
     y_true = np.asarray(y_true).ravel()
@@ -94,8 +121,8 @@ class MetricDef:
 
 
 METRIC_REGISTRY: Dict[str, MetricDef] = {
-    "average_precision": MetricDef(average_precision_score, True),
-    "roc_auc": MetricDef(roc_auc_score, True),
+    "average_precision": MetricDef(average_precision, True),
+    "roc_auc": MetricDef(roc_auc, True),
     "ks_statistic": MetricDef(ks_statistic, True),
     "recall_at_fpr": MetricDef(recall_at_fpr, True, needs="recall_at_fpr"),
     "lift_at_top_pct": MetricDef(lift_at_top_pct, True, needs="lift_top_pct"),
@@ -394,5 +421,6 @@ __all__ = [
     "split_metric_name", "format_operating_point", "operating_point",
     "evaluate_predictions", "score_vector", "decile_table",
     "population_stability_index", "psi_band",
+    "average_precision", "roc_auc",
     "ks_statistic", "recall_at_fpr", "lift_at_top_pct", "expected_calibration_error",
 ]
