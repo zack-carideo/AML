@@ -36,8 +36,11 @@ from .metrics import (
     decile_table,
     evaluate_predictions,
     make_scorers,
+    metric_names,
+    operating_point,
     population_stability_index,
     psi_band,
+    resolve_metrics,
 )
 from .pipeline import DisputeFeaturePipeline, build_model_pipeline
 from .reporting import StepReport, run_lineage
@@ -86,6 +89,9 @@ __all__ = [
     "run_lineage",
     "METRIC_REGISTRY",
     "make_scorers",
+    "metric_names",
+    "operating_point",
+    "resolve_metrics",
     "evaluate_predictions",
     "decile_table",
     "population_stability_index",

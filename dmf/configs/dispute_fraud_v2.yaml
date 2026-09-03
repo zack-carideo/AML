@@ -161,6 +161,16 @@ metrics:
     - recall_at_fpr
     - lift_at_top_pct
     - brier_score
+  # Budgets for the two curve-reading metrics. A scalar reports one number
+  # under the plain metric name. A list reports the metric at every budget, as
+  # separate columns named recall_at_fpr@0.005, recall_at_fpr@0.01, ... which
+  # is how you show a reviewer the sensitivity of the model to the operating
+  # point instead of asserting one. Everything that can only take a single
+  # number -- the shipped decision_threshold, the slice-table cut -- uses the
+  # FIRST value, so lead with the budget you intend to run at.
+  #   recall_at_fpr: [0.01, 0.02, 0.05]
+  #   lift_top_pct: [0.05, 0.10, 0.20]
+  # To select on one of them, name the point: primary: recall_at_fpr@0.01
   recall_at_fpr: 0.01                  # detection rate at a 1% false-positive budget
   lift_top_pct: 0.05                   # analyst review capacity = top 5% of volume
   compute_train_scores: true           # enables the overfit-gap diagnostic

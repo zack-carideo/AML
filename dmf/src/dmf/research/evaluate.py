@@ -38,7 +38,7 @@ import pandas as pd
 from sklearn.metrics import roc_curve
 
 from ..config import MetricsConfig
-from ..metrics import evaluate_predictions
+from ..metrics import evaluate_predictions, operating_point
 from ..reporting import json_safe
 
 #: columns of the long-format prediction table, in storage order
@@ -362,12 +362,17 @@ def implied_thresholds(y_true, y_score, metrics_cfg: Any) -> Dict[str, Any]:
     y = np.asarray(y_true).ravel().astype(int)
     s = np.asarray(y_score, dtype=float).ravel()
 
-    thr_top = float(np.quantile(s, 1 - cfg.lift_top_pct)) if cfg.lift_top_pct else None
+    # a threshold is one number, so when the config lists several budgets the
+    # first one is the operating point; the rest are reported sensitivities
+    top_pct = operating_point(cfg, "lift_top_pct")
+    fpr_point = operating_point(cfg, "recall_at_fpr")
+
+    thr_top = float(np.quantile(s, 1 - top_pct)) if top_pct else None
     thr_fpr = None
     if len(np.unique(y)) == 2:
         fpr, _, thr = roc_curve(y, s)
         thr = np.where(np.isfinite(thr), thr, float(np.max(s)))
-        thr_fpr = float(np.interp(cfg.recall_at_fpr, fpr, thr))
+        thr_fpr = float(np.interp(fpr_point, fpr, thr))
 
     policy = getattr(cfg, "decision_threshold_policy", "top_pct")
     decision = {"top_pct": thr_top, "fpr": thr_fpr, "none": None}[policy]
@@ -378,6 +383,10 @@ def implied_thresholds(y_true, y_score, metrics_cfg: Any) -> Dict[str, Any]:
         "implied_threshold_top_pct": round(thr_top, 6) if thr_top is not None else None,
         "implied_threshold_at_fpr": round(thr_fpr, 6) if thr_fpr is not None else None,
         "decision_threshold_policy": policy,
+        # the budget the shipped threshold was derived at, so a reader never has
+        # to work out which entry of a list the number came from
+        "decision_operating_point": top_pct if policy == "top_pct" else (
+            fpr_point if policy == "fpr" else None),
         "decision_threshold": round(decision, 6) if decision is not None else None,
     }
     if decision is not None:

@@ -51,6 +51,8 @@ from ..metrics import (
     evaluate_predictions,
     greater_is_better,
     make_scorers,
+    metric_names,
+    operating_point,
     orient,
     score_vector,
 )
@@ -589,8 +591,7 @@ class ModelSelectionHarness:
         recomputable from the stored rows, bit for bit.
         """
         cfg = self.config
-        names = [cfg.metrics.primary] + [m for m in cfg.metrics.secondary
-                                         if m != cfg.metrics.primary]
+        names = metric_names(cfg.metrics)
         t = time.time()
         try:
             pipe.fit(Xf, yf)
@@ -630,8 +631,7 @@ class ModelSelectionHarness:
             "features": ",".join(features),
             "fit_seconds": round(float(np.nanmean(cvres["fit_time"])), 4),
         }
-        names = [primary] + [m for m in cfg.metrics.secondary if m != primary]
-        for name in names:
+        for name in metric_names(cfg.metrics):
             test = np.asarray([orient(name, v) for v in cvres[f"test_{name}"]], dtype=float)
             row[f"cv_{name}_mean"] = round(float(np.nanmean(test)), 6)
             row[f"cv_{name}_std"] = round(float(np.nanstd(test, ddof=1)), 6) if len(test) > 1 else 0.0
@@ -967,7 +967,7 @@ class ModelSelectionHarness:
         cols = [c for c in m.slice_columns if c in X_ho.columns]
         if not cols:
             return None
-        cut = float(np.quantile(proba, 1 - m.lift_top_pct))
+        cut = float(np.quantile(proba, 1 - operating_point(m, "lift_top_pct")))
         rows = [
             {"slice_column": col, "level": level, "n": int(len(idx)),
              "prevalence": scores.get("prevalence"),

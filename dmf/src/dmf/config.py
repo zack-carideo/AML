@@ -22,7 +22,7 @@ import copy
 import typing
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, TypeVar
+from typing import Any, Dict, List, Optional, Type, TypeVar, Union
 
 import yaml
 
@@ -281,8 +281,14 @@ class MetricsConfig:
             "log_loss",
         ]
     )
-    recall_at_fpr: float = 0.01            # operating point for recall_at_fpr
-    lift_top_pct: float = 0.05             # review-budget for lift_at_top_pct
+    # Operating points for the two budget-dependent metrics. Either a scalar,
+    # or a list to report the metric at several budgets at once -- a list of N
+    # values produces N reported metrics named ``recall_at_fpr@<value>``, while
+    # a scalar keeps the plain un-suffixed name. Where only one point is
+    # possible (threshold derivation, the slice-table cut) the *first* value is
+    # used, so list the budget you intend to operate at first.
+    recall_at_fpr: Union[float, List[float]] = 0.01     # false-positive budget(s)
+    lift_top_pct: Union[float, List[float]] = 0.05      # review budget(s)
     compute_train_scores: bool = True      # enables the overfit-gap diagnostic
     # how the champion's production decision threshold is derived from its
     # holdout score distribution (saved into the model bundle so the
@@ -441,6 +447,15 @@ class Config:
             _check_in(value, allowed, where)
         if g.numeric_tolerance < 0:
             raise ValueError("preprocessing.inference_guard.numeric_tolerance must be >= 0.")
+        for attr in ("recall_at_fpr", "lift_top_pct"):
+            _check_operating_points(getattr(self.metrics, attr), f"metrics.{attr}")
+        # resolving the metric set here turns an unknown metric name, or a
+        # primary that spans several operating points, into a config error
+        # rather than a failure an hour into a sweep. Imported locally so the
+        # config module stays free of a dependency on the metric registry.
+        from .metrics import resolve_metrics
+
+        resolve_metrics(self.metrics)
         if not 0.0 < self.columns.numeric_parse_threshold <= 1.0:
             raise ValueError("columns.numeric_parse_threshold must be in (0, 1].")
         if not 0.0 < self.columns.max_categorical_cardinality_ratio <= 1.0:
@@ -496,6 +511,20 @@ class Config:
 def _check_in(value: Any, allowed: set, where: str) -> None:
     if value not in allowed:
         raise ValueError(f"{where}='{value}' is invalid; expected one of {sorted(allowed)}.")
+
+
+def _check_operating_points(value: Any, where: str) -> None:
+    """A metric budget: one number in (0, 1], or a non-empty list of distinct ones."""
+    values = list(value) if isinstance(value, (list, tuple)) else [value]
+    if not values:
+        raise ValueError(f"{where} is an empty list; supply at least one value.")
+    for v in values:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.0 < float(v) <= 1.0:
+            raise ValueError(
+                f"{where} must be a number in (0, 1] (or a list of them); got {v!r}."
+            )
+    if len({float(v) for v in values}) != len(values):
+        raise ValueError(f"{where} contains duplicate operating points: {values}.")
 
 
 __all__ = [

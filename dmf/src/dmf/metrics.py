@@ -14,7 +14,8 @@ the final holdout report are computed by the same code.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -104,13 +105,147 @@ METRIC_REGISTRY: Dict[str, MetricDef] = {
 }
 
 
-def _kwargs_for(name: str, metrics_cfg: Any) -> Dict[str, Any]:
-    spec = METRIC_REGISTRY[name]
+# --------------------------------------------------------------------------
+# operating points: one reported metric per configured value
+# --------------------------------------------------------------------------
+# ``recall_at_fpr`` and ``lift_at_top_pct`` are not single numbers -- they are
+# curves read at a chosen budget, and the choice of budget is exactly the kind
+# of decision a review wants to see varied rather than asserted. So the config
+# accepts either a scalar or a list of budgets, and a list produces one
+# reported metric per value, named ``metric@value``.
+#
+# A scalar is left un-suffixed, so every existing config, artifact and column
+# name is unchanged. The suffix appears only where a list asked for it.
+
+#: separates a metric from the operating point it is evaluated at
+OPERATING_POINT_SEP = "@"
+
+#: config attribute -> the metric-function keyword it supplies
+_NEEDS_KWARG = {"recall_at_fpr": "max_fpr", "lift_top_pct": "top_pct"}
+
+
+@dataclass(frozen=True)
+class ResolvedMetric:
+    """One column of the metric report: its name and how to compute it."""
+
+    name: str                                  # reported name, e.g. recall_at_fpr@0.005
+    base: str                                  # registry key, e.g. recall_at_fpr
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def spec(self) -> MetricDef:
+        return METRIC_REGISTRY[self.base]
+
+    @property
+    def greater_is_better(self) -> bool:
+        return self.spec.greater_is_better
+
+    def compute(self, y_true, y_score) -> float:
+        return float(self.spec.fn(y_true, y_score, **self.kwargs))
+
+
+def format_operating_point(value: float) -> str:
+    """Render an operating point for use inside a metric name."""
+    return f"{float(value):g}"
+
+
+def split_metric_name(name: str) -> Tuple[str, Optional[float]]:
+    """``'recall_at_fpr@0.01'`` -> ``('recall_at_fpr', 0.01)``; bare names -> ``(name, None)``."""
+    base, sep, point = str(name).partition(OPERATING_POINT_SEP)
+    if not sep:
+        return base, None
+    try:
+        return base, float(point)
+    except ValueError:
+        raise ValueError(
+            f"Metric '{name}' has a non-numeric operating point '{point}'. "
+            f"Expected e.g. 'recall_at_fpr{OPERATING_POINT_SEP}0.01'."
+        ) from None
+
+
+def operating_point(metrics_cfg: Any, attr: str) -> float:
+    """The single value to use where only one operating point is possible.
+
+    Threshold derivation and the slice-table cut need one number even when the
+    metric report spans several. The convention is the **first** configured
+    value, so the list is ordered by intent: lead with the budget the model is
+    actually going to run at, and put the sensitivities behind it.
+    """
+    value = getattr(metrics_cfg, attr)
+    values = list(value) if isinstance(value, (list, tuple)) else [value]
+    if not values:
+        raise ValueError(f"metrics.{attr} is an empty list; supply at least one value.")
+    return float(values[0])
+
+
+def resolve_metric(name: str, metrics_cfg: Any) -> List[ResolvedMetric]:
+    """Expand one configured metric name into the columns it produces.
+
+    A metric with no operating point yields one column under its own name. A
+    name written with an explicit point (``recall_at_fpr@0.005``) yields one
+    column at that point, whatever the config lists. A bare parametrised name
+    yields one column per configured value when the config holds a list, and a
+    single un-suffixed column when it holds a scalar.
+    """
+    base, explicit = split_metric_name(name)
+    if base not in METRIC_REGISTRY:
+        raise ValueError(f"Unknown metric '{base}'. Available: {sorted(METRIC_REGISTRY)}")
+    spec = METRIC_REGISTRY[base]
+
     if spec.needs is None:
-        return {}
-    value = getattr(metrics_cfg, spec.needs)
-    key = {"recall_at_fpr": "max_fpr", "lift_top_pct": "top_pct"}[spec.needs]
-    return {key: value}
+        if explicit is not None:
+            raise ValueError(
+                f"Metric '{base}' has no operating point, but '{name}' supplies one. "
+                f"Parametrised metrics: {sorted(k for k, v in METRIC_REGISTRY.items() if v.needs)}."
+            )
+        return [ResolvedMetric(base, base)]
+
+    kwarg = _NEEDS_KWARG[spec.needs]
+    if explicit is not None:
+        return [ResolvedMetric(f"{base}{OPERATING_POINT_SEP}{format_operating_point(explicit)}",
+                               base, {kwarg: explicit})]
+
+    configured = getattr(metrics_cfg, spec.needs)
+    if not isinstance(configured, (list, tuple)):
+        return [ResolvedMetric(base, base, {kwarg: float(configured)})]
+    if not len(configured):
+        raise ValueError(f"metrics.{spec.needs} is an empty list; supply at least one value.")
+    return [
+        ResolvedMetric(f"{base}{OPERATING_POINT_SEP}{format_operating_point(v)}",
+                       base, {kwarg: float(v)})
+        for v in configured
+    ]
+
+
+def resolve_metrics(metrics_cfg: Any) -> List[ResolvedMetric]:
+    """Every metric column the config implies, primary first, deduplicated.
+
+    This is the single source of truth for *which* metrics exist and *what they
+    are called*. The CV scorers, the fold-level score vector, the holdout
+    report and the leaderboard columns are all built from this one list, so
+    they cannot disagree about the set or the order.
+    """
+    primary = resolve_metric(metrics_cfg.primary, metrics_cfg)
+    if len(primary) > 1:
+        raise ValueError(
+            f"metrics.primary='{metrics_cfg.primary}' expands to {len(primary)} operating "
+            f"points {[m.name for m in primary]}, so there is no single column to rank the "
+            f"leaderboard on. Name the point to select on, e.g. primary: '{primary[0].name}'."
+        )
+
+    out: List[ResolvedMetric] = []
+    seen: set = set()
+    for name in [metrics_cfg.primary, *metrics_cfg.secondary]:
+        for m in resolve_metric(name, metrics_cfg):
+            if m.name not in seen:
+                seen.add(m.name)
+                out.append(m)
+    return out
+
+
+def metric_names(metrics_cfg: Any) -> List[str]:
+    """The reported metric names, primary first."""
+    return [m.name for m in resolve_metrics(metrics_cfg)]
 
 
 def make_scorers(metrics_cfg: Any) -> Dict[str, Any]:
@@ -120,19 +255,15 @@ def make_scorers(metrics_cfg: Any) -> Dict[str, Any]:
     with ``greater_is_better=False``, so sklearn returns them negated; the
     harness un-negates them for display via :func:`orient`.
     """
-    names: List[str] = [metrics_cfg.primary] + [m for m in metrics_cfg.secondary if m != metrics_cfg.primary]
-    scorers: Dict[str, Any] = {}
-    for name in names:
-        if name not in METRIC_REGISTRY:
-            raise ValueError(f"Unknown metric '{name}'. Available: {sorted(METRIC_REGISTRY)}")
-        spec = METRIC_REGISTRY[name]
-        scorers[name] = make_scorer(
-            spec.fn,
+    return {
+        m.name: make_scorer(
+            m.spec.fn,
             response_method="predict_proba",
-            greater_is_better=spec.greater_is_better,
-            **_kwargs_for(name, metrics_cfg),
+            greater_is_better=m.greater_is_better,
+            **m.kwargs,
         )
-    return scorers
+        for m in resolve_metrics(metrics_cfg)
+    }
 
 
 def score_vector(y_true, y_score, metrics_cfg: Any, signed: bool = False) -> Dict[str, float]:
@@ -144,29 +275,27 @@ def score_vector(y_true, y_score, metrics_cfg: Any, signed: bool = False) -> Dic
     derives all metrics from it instead of re-predicting once per scorer.
     A metric that cannot be computed on a fold is missing, not zero.
     """
-    names = [metrics_cfg.primary] + [m for m in metrics_cfg.secondary if m != metrics_cfg.primary]
     out: Dict[str, float] = {}
-    for name in names:
-        spec = METRIC_REGISTRY[name]
+    for m in resolve_metrics(metrics_cfg):
         try:
-            v = float(spec.fn(y_true, y_score, **_kwargs_for(name, metrics_cfg)))
+            v = m.compute(y_true, y_score)
         except Exception:
             v = float("nan")
-        if signed and not spec.greater_is_better and np.isfinite(v):
+        if signed and not m.greater_is_better and np.isfinite(v):
             v = -v
-        out[name] = v
+        out[m.name] = v
     return out
 
 
 def orient(name: str, value: float) -> float:
     """Convert a signed sklearn CV score back to its natural units."""
-    if name in METRIC_REGISTRY and not METRIC_REGISTRY[name].greater_is_better:
-        return -value
-    return value
+    return -value if not greater_is_better(name) else value
 
 
 def greater_is_better(name: str) -> bool:
-    return METRIC_REGISTRY[name].greater_is_better if name in METRIC_REGISTRY else True
+    """Direction of a reported metric, with or without an operating-point suffix."""
+    base, _ = split_metric_name(name)
+    return METRIC_REGISTRY[base].greater_is_better if base in METRIC_REGISTRY else True
 
 
 # --------------------------------------------------------------------------
@@ -174,14 +303,12 @@ def greater_is_better(name: str) -> bool:
 # --------------------------------------------------------------------------
 def evaluate_predictions(y_true, y_score, metrics_cfg: Any) -> Dict[str, float]:
     """All configured metrics in natural units, plus calibration diagnostics."""
-    names = [metrics_cfg.primary] + [m for m in metrics_cfg.secondary if m != metrics_cfg.primary]
     out: Dict[str, float] = {}
-    for name in names:
-        spec = METRIC_REGISTRY[name]
+    for m in resolve_metrics(metrics_cfg):
         try:
-            out[name] = float(spec.fn(y_true, y_score, **_kwargs_for(name, metrics_cfg)))
+            out[m.name] = m.compute(y_true, y_score)
         except Exception:
-            out[name] = float("nan")
+            out[m.name] = float("nan")
     y_true = np.asarray(y_true).ravel().astype(float)
     y_score = np.asarray(y_score).ravel()
     out["prevalence"] = float(y_true.mean())
@@ -262,6 +389,9 @@ def psi_band(psi: float) -> str:
 
 __all__ = [
     "METRIC_REGISTRY", "make_scorers", "orient", "greater_is_better",
+    "MetricDef", "ResolvedMetric", "OPERATING_POINT_SEP",
+    "resolve_metric", "resolve_metrics", "metric_names",
+    "split_metric_name", "format_operating_point", "operating_point",
     "evaluate_predictions", "score_vector", "decile_table",
     "population_stability_index", "psi_band",
     "ks_statistic", "recall_at_fpr", "lift_at_top_pct", "expected_calibration_error",
