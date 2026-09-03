@@ -14,13 +14,28 @@ run:
   verbose: 1
   save_fitted_model: true
   refit_on_full_data: true  # ship a model fit on train + holdout
+  # row-level prediction store written under the run's artifact directory, so
+  # any metric can be recomputed after the run without refitting anything.
+  # Levels are cumulative -- each stores everything below it:
+  #   none    -- store nothing
+  #   holdout -- the champion's holdout predictions (cheap; the default)
+  #   cv      -- + every validation-fold prediction of every model x k cell
+  #   all     -- + the training-side predictions of each CV fold (largest;
+  #              enables row-level overfit diagnostics)
+  # Row count scales with models x k values x folds, so cv/all grow fast.
+  save_predictions: holdout
 
 data:
   path: ./data/disputes.csv
   format: csv
   target: is_fraudulent_dispute
+  # column that uniquely identifies a record (dispute id, claim id, ...). It
+  # keys the row-level prediction store and is NEVER used as a model feature.
+  # null -> the DataFrame index is recorded instead.
+  id_column: null
   positive_label: 1
   sample_frac: null
+  read_kwargs: {}                      # extra kwargs handed to the pandas reader
 
 columns:
   # Leave both lists empty and set auto_infer: true to let the framework type
@@ -96,6 +111,7 @@ columns:
 preprocessing:
   numeric:
     imputer: median                    # numeric imputation for missing values. if you use anything other than CONSTANT, then make sure add_missing_indicator = True, so that we can identify which records were imputed, and the model also has this available during training.
+    imputer_fill_value: 0.0            # only consulted when imputer: constant
     add_missing_indicator: true        # missingness is itself informative in disputes. if True, appends a binary missingindicator_<col> column for each numeric that had missing values in training. 
     winsorize:                         # established during training, training thresholds used during inference
       enabled: true
@@ -118,6 +134,7 @@ preprocessing:
     woe:
       smoothing: 0.5
       clip: 4.0
+      report_iv: true                  # report information value per categorical
     target:
       cv: 5
       smooth: auto
@@ -164,6 +181,15 @@ metrics:
   recall_at_fpr: 0.01                  # detection rate at a 1% false-positive budget
   lift_top_pct: 0.05                   # analyst review capacity = top 5% of volume
   compute_train_scores: true           # enables the overfit-gap diagnostic
+  # how the champion's production decision threshold is derived from its
+  # holdout score distribution. It ships inside the model bundle so
+  # ProductionScorer applies a stable absolute cut rather than a
+  # batch-relative quantile:
+  #   top_pct -- the cut that flags the top lift_top_pct of holdout volume
+  #   fpr     -- the cut that achieves the recall_at_fpr false-positive rate
+  #   none    -- do not derive one; the bundle ships decision_threshold: null
+  # With a list of budgets configured above, the FIRST value is used.
+  decision_threshold_policy: top_pct
   # holdout report broken down by these columns -- they need only exist in the
   # data, not be model inputs, so flag-rate parity can be checked on attributes
   # the model is deliberately not allowed to use (Reg E / fair-treatment review)
@@ -180,6 +206,11 @@ selection:
   importance:
     method: auto                       # auto | coef | gain | permutation
     permutation_repeats: 5
+    # multiply each coefficient by the SD of its encoded column before rolling
+    # up to the source variable. Without it, summing |coef| across the levels
+    # of a high-cardinality categorical mechanically outranks a strong numeric.
+    scale_by_std: true
+    aggregate: sum                     # sum | max | mean  (encoded -> source)
   rfe:
     step: 1
     aggregate: min_rank
@@ -205,7 +236,9 @@ models:
     family: linear
     estimator: sklearn.linear_model.LogisticRegression
     requires_scaling: true
+    handles_categorical_natively: false
     imbalance: balanced
+    preprocessing_overrides: {}       # dotted preprocessing keys for this model only
     params:
       C: 1.0
       solver: lbfgs
@@ -217,6 +250,7 @@ models:
     family: linear
     estimator: sklearn.linear_model.LogisticRegression
     requires_scaling: true
+    handles_categorical_natively: false
     imbalance: balanced
     preprocessing_overrides:
       categorical.encoder: woe         # classic scorecard treatment, IV reported
@@ -231,7 +265,9 @@ models:
     family: tree
     estimator: sklearn.ensemble.RandomForestClassifier
     requires_scaling: false
+    handles_categorical_natively: false
     imbalance: balanced
+    preprocessing_overrides: {}       # dotted preprocessing keys for this model only
     params:
       n_estimators: 400
       min_samples_leaf: 20
@@ -244,7 +280,9 @@ models:
     family: tree
     estimator: sklearn.ensemble.HistGradientBoostingClassifier
     requires_scaling: false
+    handles_categorical_natively: false
     imbalance: balanced
+    preprocessing_overrides: {}       # dotted preprocessing keys for this model only
     params:
       max_iter: 300
       learning_rate: 0.06
@@ -258,6 +296,7 @@ models:
     family: tree
     estimator: xgboost.XGBClassifier
     requires_scaling: false
+    handles_categorical_natively: false
     imbalance: scale_pos_weight
     preprocessing_overrides:
       categorical.encoder: ordinal     # trees split ordinal codes fine and stay narrow
@@ -279,6 +318,7 @@ models:
     family: tree
     estimator: lightgbm.LGBMClassifier
     requires_scaling: false
+    handles_categorical_natively: false
     imbalance: balanced
     preprocessing_overrides:
       categorical.encoder: ordinal
