@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python utils\\\\mask_data.py)",
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; python utils\\\\mask_data.py)"
+    ]
+  }
+}
