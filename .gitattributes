@@ -1,0 +1,24 @@
+# Line endings are pinned by the repository, not by each machine's git.
+#
+# core.autocrlf lives in per-machine config, so it varies by install (Git for
+# Windows vs WSL vs an IDE-bundled git). When a git that does not apply it
+# stages a working tree that a git which does applied it to, CRLF goes into the
+# object database verbatim and every line of every file reads as changed --
+# 5351 lines of pure line-ending churn with no content difference. This file
+# removes the setting from the equation.
+#
+# eol=lf pins the *working tree* too, not just the index, so a tool reading
+# bytes off disk sees the same thing the repository holds.
+
+* text=auto
+
+*.py     text eol=lf
+*.ipynb  text eol=lf
+*.yaml   text eol=lf
+*.yml    text eol=lf
+*.toml   text eol=lf
+*.md     text eol=lf
+*.txt    text eol=lf
+*.svg    text eol=lf
+
+*.docx   binary
