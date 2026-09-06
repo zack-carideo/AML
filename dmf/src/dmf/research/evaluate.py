@@ -187,7 +187,9 @@ def write_prediction_artifacts(
     meta["n_rows"] = int(len(preds))
     meta["rows_per_stage"] = log.stage_counts()
     meta["files"] = written
-    (out / "predictions_meta.json").write_text(json.dumps(json_safe(meta), indent=2))
+    # full precision: the sidecar carries the decision threshold, and a rounded
+    # copy of a cut is a different cut on a discrete score scale
+    (out / "predictions_meta.json").write_text(json.dumps(json_safe(meta, ndigits=None), indent=2))
     written["meta"] = "predictions_meta.json"
     return written
 
@@ -379,15 +381,20 @@ def implied_thresholds(y_true, y_score, metrics_cfg: Any) -> Dict[str, Any]:
     if decision is not None and not np.isfinite(decision):
         decision = None
 
+    # Thresholds are stored at full precision, never rounded. The scorer applies
+    # ``score >= threshold``, and on a model with a discrete score scale many
+    # rows tie exactly at the quantile; rounding the stored value up by one unit
+    # in the sixth decimal silently drops every one of them, so the shipped cut
+    # no longer flags the share of volume the reported decision_flag_rate says.
     out: Dict[str, Any] = {
-        "implied_threshold_top_pct": round(thr_top, 6) if thr_top is not None else None,
-        "implied_threshold_at_fpr": round(thr_fpr, 6) if thr_fpr is not None else None,
+        "implied_threshold_top_pct": thr_top,
+        "implied_threshold_at_fpr": thr_fpr,
         "decision_threshold_policy": policy,
         # the budget the shipped threshold was derived at, so a reader never has
         # to work out which entry of a list the number came from
         "decision_operating_point": top_pct if policy == "top_pct" else (
             fpr_point if policy == "fpr" else None),
-        "decision_threshold": round(decision, 6) if decision is not None else None,
+        "decision_threshold": decision,
     }
     if decision is not None:
         flag = s >= decision

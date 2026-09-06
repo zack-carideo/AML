@@ -40,6 +40,8 @@ from .metrics import (
     operating_point,
     population_stability_index,
     psi_band,
+    psi_from_reference_quantiles,
+    reference_quantiles,
     resolve_metrics,
 )
 from .pipeline import DisputeFeaturePipeline, build_model_pipeline
@@ -96,6 +98,8 @@ __all__ = [
     "decile_table",
     "population_stability_index",
     "psi_band",
+    "psi_from_reference_quantiles",
+    "reference_quantiles",
     "ROW_FLAG_COLUMNS",
     "Roles",
     "infer_roles",

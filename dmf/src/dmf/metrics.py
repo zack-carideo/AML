@@ -15,7 +15,7 @@ the final holdout report are computed by the same code.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -408,6 +408,79 @@ def population_stability_index(
     return float(np.sum((a - e) * np.log(a / e)))
 
 
+#: probability levels at which the shipped model's holdout score distribution is
+#: summarised in the bundle. Fine on purpose: quantiles describe a *discrete*
+#: score scale only to within one level's mass, and a two-variable model can
+#: have under fifty distinct scores. PSI itself is computed on far fewer bins
+#: (see ``psi_from_reference_quantiles``); the fine grid is what lets the
+#: expected mass of each coarse bin be read off accurately.
+REFERENCE_QUANTILE_LEVELS = 101
+
+
+def reference_quantiles(scores: np.ndarray, levels: int = REFERENCE_QUANTILE_LEVELS) -> List[float]:
+    """The score-distribution summary the bundle stores for PSI monitoring.
+
+    ``levels`` evenly spaced probability levels, each mapped to an *observed*
+    score (``inverted_cdf``, no interpolation). An interpolated quantile puts a
+    bin edge at a value no row ever takes; on a discrete scale the bin between
+    two adjacent observed scores then carries expected mass but can never hold
+    an actual row, and an unchanged population reads as drift.
+    """
+    s = np.asarray(scores, dtype=float)
+    s = s[np.isfinite(s)]
+    if s.size == 0:
+        return []
+    return [float(q) for q in np.quantile(s, np.linspace(0.0, 1.0, levels), method="inverted_cdf")]
+
+
+def psi_from_reference_quantiles(
+    reference_quantiles: Sequence[float],
+    actual: np.ndarray,
+    n_bins: int = 10,
+    epsilon: float = 1e-6,
+) -> float:
+    """PSI of ``actual`` against a reference known only through its quantiles.
+
+    Production has the bundle's ``reference_score_quantiles`` and nothing else
+    -- no holdout, no training table -- so this reconstructs what
+    :func:`population_stability_index` would compute from the raw reference:
+
+    * **bins** are the reference quantiles at ``n_bins + 1`` evenly spaced
+      levels of the stored grid (deciles by default, matching the raw version
+      and keeping PSI's small-sample bias, roughly ``n_bins / batch_size``,
+      where a monitoring threshold expects it);
+    * **expected mass** of each bin is read off the *full* stored grid: the
+      first level at which the quantile reaches a bin edge is the mass strictly
+      below that edge, to within one grid step. On a discrete score scale this
+      is what makes a tied block come out with its true mass instead of being
+      counted once.
+
+    Equivalent to ``population_stability_index(reference, actual, n_bins)`` when
+    the reference is continuous.
+    """
+    q = np.asarray(reference_quantiles, dtype=float)
+    actual = np.asarray(actual, dtype=float)
+    actual = actual[np.isfinite(actual)]
+    if q.size < 3 or not np.all(np.isfinite(q)) or actual.size == 0:
+        return float("nan")
+    m = q.size
+    levels = np.linspace(0.0, 1.0, m)
+    uniq, first = np.unique(q, return_index=True)
+    mass_below = dict(zip(uniq.tolist(), levels[first].tolist()))
+
+    idx = np.unique(np.round(np.linspace(0, m - 1, n_bins + 1)).astype(int))
+    edges = np.unique(q[idx])
+    if len(edges) < 3:
+        return 0.0
+    below = np.r_[0.0, [mass_below[v] for v in edges[1:-1]], 1.0]
+    expected = np.diff(below)                       # (-inf,e1), [e1,e2), ..., [e_{k-2}, inf)
+    cut = edges.copy()
+    cut[0], cut[-1] = -np.inf, np.inf
+    observed = np.histogram(actual, bins=cut)[0] / actual.size
+    e, a = np.clip(expected, epsilon, None), np.clip(observed, epsilon, None)
+    return float(np.sum((a - e) * np.log(a / e)))
+
+
 def psi_band(psi: float) -> str:
     if not np.isfinite(psi):
         return "unknown"
@@ -420,7 +493,8 @@ __all__ = [
     "resolve_metric", "resolve_metrics", "metric_names",
     "split_metric_name", "format_operating_point", "operating_point",
     "evaluate_predictions", "score_vector", "decile_table",
-    "population_stability_index", "psi_band",
+    "population_stability_index", "psi_from_reference_quantiles", "psi_band",
+    "reference_quantiles", "REFERENCE_QUANTILE_LEVELS",
     "average_precision", "roc_auc",
     "ks_statistic", "recall_at_fpr", "lift_at_top_pct", "expected_calibration_error",
 ]
