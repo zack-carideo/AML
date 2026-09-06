@@ -21,35 +21,41 @@ import numpy as np
 import pandas as pd
 
 
-def _num(x: Any) -> Any:
-    """Coerce numpy scalars to json-serialisable python types."""
+def _num(x: Any, ndigits: Optional[int] = 6) -> Any:
+    """Coerce numpy scalars to json-serialisable python types.
+
+    Floats are rounded to ``ndigits`` for readable reports; pass ``None`` to
+    keep full precision. Anything applied as a cut -- a decision threshold, a
+    reference quantile -- must be written unrounded, or ties at the value are
+    silently dropped by the ``>=`` the scorer applies.
+    """
     if x is None:
         return None
     if isinstance(x, (np.integer,)):
         return int(x)
     if isinstance(x, (np.floating,)):
         v = float(x)
-        return None if not np.isfinite(v) else round(v, 6)
+        return None if not np.isfinite(v) else (round(v, ndigits) if ndigits is not None else v)
     if isinstance(x, (np.bool_,)):
         return bool(x)
     if isinstance(x, float):
-        return None if not np.isfinite(x) else round(x, 6)
+        return None if not np.isfinite(x) else (round(x, ndigits) if ndigits is not None else x)
     return x
 
 
-def json_safe(obj: Any) -> Any:
+def json_safe(obj: Any, ndigits: Optional[int] = 6) -> Any:
     """Recursively coerce a structure into something json.dumps can handle."""
     if isinstance(obj, dict):
-        return {str(k): json_safe(v) for k, v in obj.items()}
+        return {str(k): json_safe(v, ndigits) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
-        return [json_safe(v) for v in obj]
+        return [json_safe(v, ndigits) for v in obj]
     if isinstance(obj, (np.ndarray,)):
-        return [json_safe(v) for v in obj.tolist()]
+        return [json_safe(v, ndigits) for v in obj.tolist()]
     if isinstance(obj, pd.Series):
-        return {str(k): json_safe(v) for k, v in obj.items()}
+        return {str(k): json_safe(v, ndigits) for k, v in obj.items()}
     if isinstance(obj, pd.DataFrame):
-        return json_safe(obj.to_dict(orient="records"))
-    return _num(obj)
+        return json_safe(obj.to_dict(orient="records"), ndigits)
+    return _num(obj, ndigits)
 
 
 # --------------------------------------------------------------------------

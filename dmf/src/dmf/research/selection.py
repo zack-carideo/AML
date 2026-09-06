@@ -51,7 +51,10 @@ from ..metrics import (
     evaluate_predictions,
     greater_is_better,
     make_scorers,
+    metric_names,
+    operating_point,
     orient,
+    reference_quantiles,
     score_vector,
 )
 from ..pipeline import DisputeFeaturePipeline, build_model_pipeline
@@ -589,8 +592,7 @@ class ModelSelectionHarness:
         recomputable from the stored rows, bit for bit.
         """
         cfg = self.config
-        names = [cfg.metrics.primary] + [m for m in cfg.metrics.secondary
-                                         if m != cfg.metrics.primary]
+        names = metric_names(cfg.metrics)
         t = time.time()
         try:
             pipe.fit(Xf, yf)
@@ -630,8 +632,7 @@ class ModelSelectionHarness:
             "features": ",".join(features),
             "fit_seconds": round(float(np.nanmean(cvres["fit_time"])), 4),
         }
-        names = [primary] + [m for m in cfg.metrics.secondary if m != primary]
-        for name in names:
+        for name in metric_names(cfg.metrics):
             test = np.asarray([orient(name, v) for v in cvres[f"test_{name}"]], dtype=float)
             row[f"cv_{name}_mean"] = round(float(np.nanmean(test)), 6)
             row[f"cv_{name}_std"] = round(float(np.nanstd(test, ddof=1)), 6) if len(test) > 1 else 0.0
@@ -908,11 +909,6 @@ class ModelSelectionHarness:
         holdout.update(implied_thresholds(y_ho, proba, cfg.metrics))
         self.predictions_.add("holdout", selected["model"], selected["k"], None, None,
                               self.row_ids_ho_, y_ho, proba)
-        # the reference distribution PSI needs in production; without it the
-        # monitoring helper cannot run without reloading the training table
-        holdout["reference_score_quantiles"] = [
-            round(float(q), 6) for q in np.quantile(proba, np.linspace(0, 1, 21))
-        ]
 
         primary = cfg.metrics.primary
         self.report.add(
@@ -939,8 +935,7 @@ class ModelSelectionHarness:
         if cfg.run.refit_on_full_data:
             final = build_model_pipeline(prod_cfg, features, entry["estimator"])
             final.fit(X_all, y_all)
-            self.report.add(
-                "production_refit",
+            refit_info: Dict[str, Any] = dict(
                 refit_on="train+holdout",
                 n_rows=len(X_all),
                 n_variables=len(features),
@@ -948,10 +943,64 @@ class ModelSelectionHarness:
             )
         else:
             final = pipe
-            self.report.add("production_refit", refit_on="train_only", n_rows=len(X_tr))
+            refit_info = dict(refit_on="train_only", n_rows=len(X_tr))
+
+        # Everything that ships beside the model must describe the model that
+        # ships. The holdout numbers above are the *validated* evidence and stay
+        # as measured on the train-only fit; the monitoring reference and the
+        # capacity cut are re-derived from the production pipeline's own scores
+        # on the same holdout rows, because with refit_on_full_data that is a
+        # different fit -- and on a discrete score scale the two can disagree
+        # badly (PSI > 3 between them has been observed on a two-variable model).
+        holdout.update(self._shipped_reference(final, X_ho, proba, holdout))
+        self.report.add(
+            "production_refit",
+            **refit_info,
+            reference_score_source=holdout["reference_score_source"],
+            decision_threshold_source=holdout["decision_threshold_source"],
+            decision_threshold=holdout["decision_threshold"],
+            decision_threshold_train_only=holdout["decision_threshold_train_only"],
+            decision_threshold_shift=(
+                round(float(holdout["decision_threshold"] - holdout["decision_threshold_train_only"]), 6)
+                if holdout["decision_threshold"] is not None
+                and holdout["decision_threshold_train_only"] is not None else None
+            ),
+            decision_flag_rate_shipped=holdout["decision_flag_rate_shipped"],
+        )
 
         feat: DisputeFeaturePipeline = final.named_steps["features"]
         return final, holdout, deciles, self._holdout_slices(X_ho, y_ho, proba), feat.fit_report_
+
+    def _shipped_reference(self, final, X_ho, proba_train_only, holdout) -> Dict[str, Any]:
+        """Monitoring reference and decision threshold for the pipeline that ships.
+
+        ``reference_score_quantiles`` is always the shipped pipeline's score
+        distribution on the holdout rows. The ``top_pct`` threshold is a
+        capacity cut -- a quantile of scores -- so it is re-derived from the same
+        scores. The ``fpr`` threshold depends on labels, and after a refit that
+        saw the holdout labels the holdout is no longer out-of-sample for it, so
+        it is left as derived on the train-only fit and labelled as such.
+        """
+        cfg = self.config
+        refit = self.config.run.refit_on_full_data
+        proba_ship = np.asarray(final.predict_proba(X_ho))[:, 1] if refit else proba_train_only
+        source = "production_refit" if refit else "train_only_fit"
+
+        out: Dict[str, Any] = {
+            "reference_score_quantiles": reference_quantiles(proba_ship),
+            "reference_score_source": source,
+            "decision_threshold_train_only": holdout.get("decision_threshold"),
+            "decision_threshold_source": "train_only_fit",
+        }
+        policy = holdout.get("decision_threshold_policy")
+        if refit and policy == "top_pct":
+            out["decision_threshold"] = float(np.quantile(proba_ship, 1 - operating_point(cfg.metrics, "lift_top_pct")))
+            out["decision_threshold_source"] = source
+        thr = out.get("decision_threshold", holdout.get("decision_threshold"))
+        out["decision_flag_rate_shipped"] = (
+            round(float((proba_ship >= thr).mean()), 6) if thr is not None and len(proba_ship) else None
+        )
+        return out
 
     def _holdout_slices(self, X_ho, y_ho, proba) -> Optional[pd.DataFrame]:
         """Holdout performance and flag rate per segment level.
@@ -967,7 +1016,7 @@ class ModelSelectionHarness:
         cols = [c for c in m.slice_columns if c in X_ho.columns]
         if not cols:
             return None
-        cut = float(np.quantile(proba, 1 - m.lift_top_pct))
+        cut = float(np.quantile(proba, 1 - operating_point(m, "lift_top_pct")))
         rows = [
             {"slice_column": col, "level": level, "n": int(len(idx)),
              "prevalence": scores.get("prevalence"),
@@ -1025,7 +1074,10 @@ class ModelSelectionHarness:
             "feature_pipeline_report.json": result.feature_report,
         }
         for name, payload in blobs.items():
-            (out / name).write_text(json.dumps(json_safe(payload), indent=2))
+            # holdout_metrics.json carries the thresholds and the reference
+            # quantiles the bundle applies; those must round-trip exactly
+            ndigits = None if name == "holdout_metrics.json" else 6
+            (out / name).write_text(json.dumps(json_safe(payload, ndigits=ndigits), indent=2))
 
         lineage = self.report.get("lineage") or {}
         written = write_prediction_artifacts(out, self.predictions_, meta={
@@ -1044,6 +1096,8 @@ class ModelSelectionHarness:
             "metrics": cfg.to_dict()["metrics"],
             "decision_threshold": result.holdout_metrics.get("decision_threshold"),
             "decision_threshold_policy": result.holdout_metrics.get("decision_threshold_policy"),
+            "decision_threshold_source": result.holdout_metrics.get("decision_threshold_source"),
+            "reference_score_source": result.holdout_metrics.get("reference_score_source"),
             "implied_threshold_top_pct": result.holdout_metrics.get("implied_threshold_top_pct"),
             "implied_threshold_at_fpr": result.holdout_metrics.get("implied_threshold_at_fpr"),
         })
@@ -1092,6 +1146,13 @@ class ModelSelectionHarness:
                      "decision_threshold": result.holdout_metrics.get("decision_threshold"),
                      "decision_threshold_policy": result.holdout_metrics.get(
                          "decision_threshold_policy"),
+                     # which fit the threshold and the monitoring reference
+                     # describe: the shipped refit where possible, otherwise
+                     # the train-only fit (see _shipped_reference)
+                     "decision_threshold_source": result.holdout_metrics.get(
+                         "decision_threshold_source"),
+                     "reference_score_source": result.holdout_metrics.get(
+                         "reference_score_source"),
                      # reference distribution for PSI monitoring, so drift can be
                      # measured in production without reloading the training table
                      "reference_score_quantiles": result.holdout_metrics.get(

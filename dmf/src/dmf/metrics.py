@@ -14,7 +14,8 @@ the final holdout report are computed by the same code.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -31,6 +32,33 @@ from sklearn.metrics import (
 # --------------------------------------------------------------------------
 # metric functions (y_true, y_score) -> float
 # --------------------------------------------------------------------------
+def _has_both_classes(y_true) -> bool:
+    """A ranking metric is undefined unless both classes are present.
+
+    sklearn disagrees with itself here: ``roc_auc_score`` raises on a
+    single-class target, while ``average_precision_score`` warns and returns
+    0.0 -- which then lands in a report as if a model had scored terribly on
+    a segment where nothing was measurable. Every discrimination metric in the
+    registry runs this check first and returns NaN, which the reporting layer
+    renders as null.
+    """
+    return len(np.unique(np.asarray(y_true).ravel())) >= 2
+
+
+def average_precision(y_true, y_score) -> float:
+    """PR-AUC; NaN rather than sklearn's 0.0 when ``y_true`` has no positives."""
+    if not _has_both_classes(y_true):
+        return float("nan")
+    return float(average_precision_score(y_true, y_score))
+
+
+def roc_auc(y_true, y_score) -> float:
+    """ROC-AUC; NaN rather than an exception when ``y_true`` is single-class."""
+    if not _has_both_classes(y_true):
+        return float("nan")
+    return float(roc_auc_score(y_true, y_score))
+
+
 def ks_statistic(y_true, y_score) -> float:
     """Kolmogorov-Smirnov separation: max(TPR - FPR) over all thresholds."""
     y_true = np.asarray(y_true).ravel()
@@ -93,8 +121,8 @@ class MetricDef:
 
 
 METRIC_REGISTRY: Dict[str, MetricDef] = {
-    "average_precision": MetricDef(average_precision_score, True),
-    "roc_auc": MetricDef(roc_auc_score, True),
+    "average_precision": MetricDef(average_precision, True),
+    "roc_auc": MetricDef(roc_auc, True),
     "ks_statistic": MetricDef(ks_statistic, True),
     "recall_at_fpr": MetricDef(recall_at_fpr, True, needs="recall_at_fpr"),
     "lift_at_top_pct": MetricDef(lift_at_top_pct, True, needs="lift_top_pct"),
@@ -104,13 +132,147 @@ METRIC_REGISTRY: Dict[str, MetricDef] = {
 }
 
 
-def _kwargs_for(name: str, metrics_cfg: Any) -> Dict[str, Any]:
-    spec = METRIC_REGISTRY[name]
+# --------------------------------------------------------------------------
+# operating points: one reported metric per configured value
+# --------------------------------------------------------------------------
+# ``recall_at_fpr`` and ``lift_at_top_pct`` are not single numbers -- they are
+# curves read at a chosen budget, and the choice of budget is exactly the kind
+# of decision a review wants to see varied rather than asserted. So the config
+# accepts either a scalar or a list of budgets, and a list produces one
+# reported metric per value, named ``metric@value``.
+#
+# A scalar is left un-suffixed, so every existing config, artifact and column
+# name is unchanged. The suffix appears only where a list asked for it.
+
+#: separates a metric from the operating point it is evaluated at
+OPERATING_POINT_SEP = "@"
+
+#: config attribute -> the metric-function keyword it supplies
+_NEEDS_KWARG = {"recall_at_fpr": "max_fpr", "lift_top_pct": "top_pct"}
+
+
+@dataclass(frozen=True)
+class ResolvedMetric:
+    """One column of the metric report: its name and how to compute it."""
+
+    name: str                                  # reported name, e.g. recall_at_fpr@0.005
+    base: str                                  # registry key, e.g. recall_at_fpr
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def spec(self) -> MetricDef:
+        return METRIC_REGISTRY[self.base]
+
+    @property
+    def greater_is_better(self) -> bool:
+        return self.spec.greater_is_better
+
+    def compute(self, y_true, y_score) -> float:
+        return float(self.spec.fn(y_true, y_score, **self.kwargs))
+
+
+def format_operating_point(value: float) -> str:
+    """Render an operating point for use inside a metric name."""
+    return f"{float(value):g}"
+
+
+def split_metric_name(name: str) -> Tuple[str, Optional[float]]:
+    """``'recall_at_fpr@0.01'`` -> ``('recall_at_fpr', 0.01)``; bare names -> ``(name, None)``."""
+    base, sep, point = str(name).partition(OPERATING_POINT_SEP)
+    if not sep:
+        return base, None
+    try:
+        return base, float(point)
+    except ValueError:
+        raise ValueError(
+            f"Metric '{name}' has a non-numeric operating point '{point}'. "
+            f"Expected e.g. 'recall_at_fpr{OPERATING_POINT_SEP}0.01'."
+        ) from None
+
+
+def operating_point(metrics_cfg: Any, attr: str) -> float:
+    """The single value to use where only one operating point is possible.
+
+    Threshold derivation and the slice-table cut need one number even when the
+    metric report spans several. The convention is the **first** configured
+    value, so the list is ordered by intent: lead with the budget the model is
+    actually going to run at, and put the sensitivities behind it.
+    """
+    value = getattr(metrics_cfg, attr)
+    values = list(value) if isinstance(value, (list, tuple)) else [value]
+    if not values:
+        raise ValueError(f"metrics.{attr} is an empty list; supply at least one value.")
+    return float(values[0])
+
+
+def resolve_metric(name: str, metrics_cfg: Any) -> List[ResolvedMetric]:
+    """Expand one configured metric name into the columns it produces.
+
+    A metric with no operating point yields one column under its own name. A
+    name written with an explicit point (``recall_at_fpr@0.005``) yields one
+    column at that point, whatever the config lists. A bare parametrised name
+    yields one column per configured value when the config holds a list, and a
+    single un-suffixed column when it holds a scalar.
+    """
+    base, explicit = split_metric_name(name)
+    if base not in METRIC_REGISTRY:
+        raise ValueError(f"Unknown metric '{base}'. Available: {sorted(METRIC_REGISTRY)}")
+    spec = METRIC_REGISTRY[base]
+
     if spec.needs is None:
-        return {}
-    value = getattr(metrics_cfg, spec.needs)
-    key = {"recall_at_fpr": "max_fpr", "lift_top_pct": "top_pct"}[spec.needs]
-    return {key: value}
+        if explicit is not None:
+            raise ValueError(
+                f"Metric '{base}' has no operating point, but '{name}' supplies one. "
+                f"Parametrised metrics: {sorted(k for k, v in METRIC_REGISTRY.items() if v.needs)}."
+            )
+        return [ResolvedMetric(base, base)]
+
+    kwarg = _NEEDS_KWARG[spec.needs]
+    if explicit is not None:
+        return [ResolvedMetric(f"{base}{OPERATING_POINT_SEP}{format_operating_point(explicit)}",
+                               base, {kwarg: explicit})]
+
+    configured = getattr(metrics_cfg, spec.needs)
+    if not isinstance(configured, (list, tuple)):
+        return [ResolvedMetric(base, base, {kwarg: float(configured)})]
+    if not len(configured):
+        raise ValueError(f"metrics.{spec.needs} is an empty list; supply at least one value.")
+    return [
+        ResolvedMetric(f"{base}{OPERATING_POINT_SEP}{format_operating_point(v)}",
+                       base, {kwarg: float(v)})
+        for v in configured
+    ]
+
+
+def resolve_metrics(metrics_cfg: Any) -> List[ResolvedMetric]:
+    """Every metric column the config implies, primary first, deduplicated.
+
+    This is the single source of truth for *which* metrics exist and *what they
+    are called*. The CV scorers, the fold-level score vector, the holdout
+    report and the leaderboard columns are all built from this one list, so
+    they cannot disagree about the set or the order.
+    """
+    primary = resolve_metric(metrics_cfg.primary, metrics_cfg)
+    if len(primary) > 1:
+        raise ValueError(
+            f"metrics.primary='{metrics_cfg.primary}' expands to {len(primary)} operating "
+            f"points {[m.name for m in primary]}, so there is no single column to rank the "
+            f"leaderboard on. Name the point to select on, e.g. primary: '{primary[0].name}'."
+        )
+
+    out: List[ResolvedMetric] = []
+    seen: set = set()
+    for name in [metrics_cfg.primary, *metrics_cfg.secondary]:
+        for m in resolve_metric(name, metrics_cfg):
+            if m.name not in seen:
+                seen.add(m.name)
+                out.append(m)
+    return out
+
+
+def metric_names(metrics_cfg: Any) -> List[str]:
+    """The reported metric names, primary first."""
+    return [m.name for m in resolve_metrics(metrics_cfg)]
 
 
 def make_scorers(metrics_cfg: Any) -> Dict[str, Any]:
@@ -120,19 +282,15 @@ def make_scorers(metrics_cfg: Any) -> Dict[str, Any]:
     with ``greater_is_better=False``, so sklearn returns them negated; the
     harness un-negates them for display via :func:`orient`.
     """
-    names: List[str] = [metrics_cfg.primary] + [m for m in metrics_cfg.secondary if m != metrics_cfg.primary]
-    scorers: Dict[str, Any] = {}
-    for name in names:
-        if name not in METRIC_REGISTRY:
-            raise ValueError(f"Unknown metric '{name}'. Available: {sorted(METRIC_REGISTRY)}")
-        spec = METRIC_REGISTRY[name]
-        scorers[name] = make_scorer(
-            spec.fn,
+    return {
+        m.name: make_scorer(
+            m.spec.fn,
             response_method="predict_proba",
-            greater_is_better=spec.greater_is_better,
-            **_kwargs_for(name, metrics_cfg),
+            greater_is_better=m.greater_is_better,
+            **m.kwargs,
         )
-    return scorers
+        for m in resolve_metrics(metrics_cfg)
+    }
 
 
 def score_vector(y_true, y_score, metrics_cfg: Any, signed: bool = False) -> Dict[str, float]:
@@ -144,29 +302,27 @@ def score_vector(y_true, y_score, metrics_cfg: Any, signed: bool = False) -> Dic
     derives all metrics from it instead of re-predicting once per scorer.
     A metric that cannot be computed on a fold is missing, not zero.
     """
-    names = [metrics_cfg.primary] + [m for m in metrics_cfg.secondary if m != metrics_cfg.primary]
     out: Dict[str, float] = {}
-    for name in names:
-        spec = METRIC_REGISTRY[name]
+    for m in resolve_metrics(metrics_cfg):
         try:
-            v = float(spec.fn(y_true, y_score, **_kwargs_for(name, metrics_cfg)))
+            v = m.compute(y_true, y_score)
         except Exception:
             v = float("nan")
-        if signed and not spec.greater_is_better and np.isfinite(v):
+        if signed and not m.greater_is_better and np.isfinite(v):
             v = -v
-        out[name] = v
+        out[m.name] = v
     return out
 
 
 def orient(name: str, value: float) -> float:
     """Convert a signed sklearn CV score back to its natural units."""
-    if name in METRIC_REGISTRY and not METRIC_REGISTRY[name].greater_is_better:
-        return -value
-    return value
+    return -value if not greater_is_better(name) else value
 
 
 def greater_is_better(name: str) -> bool:
-    return METRIC_REGISTRY[name].greater_is_better if name in METRIC_REGISTRY else True
+    """Direction of a reported metric, with or without an operating-point suffix."""
+    base, _ = split_metric_name(name)
+    return METRIC_REGISTRY[base].greater_is_better if base in METRIC_REGISTRY else True
 
 
 # --------------------------------------------------------------------------
@@ -174,14 +330,12 @@ def greater_is_better(name: str) -> bool:
 # --------------------------------------------------------------------------
 def evaluate_predictions(y_true, y_score, metrics_cfg: Any) -> Dict[str, float]:
     """All configured metrics in natural units, plus calibration diagnostics."""
-    names = [metrics_cfg.primary] + [m for m in metrics_cfg.secondary if m != metrics_cfg.primary]
     out: Dict[str, float] = {}
-    for name in names:
-        spec = METRIC_REGISTRY[name]
+    for m in resolve_metrics(metrics_cfg):
         try:
-            out[name] = float(spec.fn(y_true, y_score, **_kwargs_for(name, metrics_cfg)))
+            out[m.name] = m.compute(y_true, y_score)
         except Exception:
-            out[name] = float("nan")
+            out[m.name] = float("nan")
     y_true = np.asarray(y_true).ravel().astype(float)
     y_score = np.asarray(y_score).ravel()
     out["prevalence"] = float(y_true.mean())
@@ -254,6 +408,79 @@ def population_stability_index(
     return float(np.sum((a - e) * np.log(a / e)))
 
 
+#: probability levels at which the shipped model's holdout score distribution is
+#: summarised in the bundle. Fine on purpose: quantiles describe a *discrete*
+#: score scale only to within one level's mass, and a two-variable model can
+#: have under fifty distinct scores. PSI itself is computed on far fewer bins
+#: (see ``psi_from_reference_quantiles``); the fine grid is what lets the
+#: expected mass of each coarse bin be read off accurately.
+REFERENCE_QUANTILE_LEVELS = 101
+
+
+def reference_quantiles(scores: np.ndarray, levels: int = REFERENCE_QUANTILE_LEVELS) -> List[float]:
+    """The score-distribution summary the bundle stores for PSI monitoring.
+
+    ``levels`` evenly spaced probability levels, each mapped to an *observed*
+    score (``inverted_cdf``, no interpolation). An interpolated quantile puts a
+    bin edge at a value no row ever takes; on a discrete scale the bin between
+    two adjacent observed scores then carries expected mass but can never hold
+    an actual row, and an unchanged population reads as drift.
+    """
+    s = np.asarray(scores, dtype=float)
+    s = s[np.isfinite(s)]
+    if s.size == 0:
+        return []
+    return [float(q) for q in np.quantile(s, np.linspace(0.0, 1.0, levels), method="inverted_cdf")]
+
+
+def psi_from_reference_quantiles(
+    reference_quantiles: Sequence[float],
+    actual: np.ndarray,
+    n_bins: int = 10,
+    epsilon: float = 1e-6,
+) -> float:
+    """PSI of ``actual`` against a reference known only through its quantiles.
+
+    Production has the bundle's ``reference_score_quantiles`` and nothing else
+    -- no holdout, no training table -- so this reconstructs what
+    :func:`population_stability_index` would compute from the raw reference:
+
+    * **bins** are the reference quantiles at ``n_bins + 1`` evenly spaced
+      levels of the stored grid (deciles by default, matching the raw version
+      and keeping PSI's small-sample bias, roughly ``n_bins / batch_size``,
+      where a monitoring threshold expects it);
+    * **expected mass** of each bin is read off the *full* stored grid: the
+      first level at which the quantile reaches a bin edge is the mass strictly
+      below that edge, to within one grid step. On a discrete score scale this
+      is what makes a tied block come out with its true mass instead of being
+      counted once.
+
+    Equivalent to ``population_stability_index(reference, actual, n_bins)`` when
+    the reference is continuous.
+    """
+    q = np.asarray(reference_quantiles, dtype=float)
+    actual = np.asarray(actual, dtype=float)
+    actual = actual[np.isfinite(actual)]
+    if q.size < 3 or not np.all(np.isfinite(q)) or actual.size == 0:
+        return float("nan")
+    m = q.size
+    levels = np.linspace(0.0, 1.0, m)
+    uniq, first = np.unique(q, return_index=True)
+    mass_below = dict(zip(uniq.tolist(), levels[first].tolist()))
+
+    idx = np.unique(np.round(np.linspace(0, m - 1, n_bins + 1)).astype(int))
+    edges = np.unique(q[idx])
+    if len(edges) < 3:
+        return 0.0
+    below = np.r_[0.0, [mass_below[v] for v in edges[1:-1]], 1.0]
+    expected = np.diff(below)                       # (-inf,e1), [e1,e2), ..., [e_{k-2}, inf)
+    cut = edges.copy()
+    cut[0], cut[-1] = -np.inf, np.inf
+    observed = np.histogram(actual, bins=cut)[0] / actual.size
+    e, a = np.clip(expected, epsilon, None), np.clip(observed, epsilon, None)
+    return float(np.sum((a - e) * np.log(a / e)))
+
+
 def psi_band(psi: float) -> str:
     if not np.isfinite(psi):
         return "unknown"
@@ -262,7 +489,12 @@ def psi_band(psi: float) -> str:
 
 __all__ = [
     "METRIC_REGISTRY", "make_scorers", "orient", "greater_is_better",
+    "MetricDef", "ResolvedMetric", "OPERATING_POINT_SEP",
+    "resolve_metric", "resolve_metrics", "metric_names",
+    "split_metric_name", "format_operating_point", "operating_point",
     "evaluate_predictions", "score_vector", "decile_table",
-    "population_stability_index", "psi_band",
+    "population_stability_index", "psi_from_reference_quantiles", "psi_band",
+    "reference_quantiles", "REFERENCE_QUANTILE_LEVELS",
+    "average_precision", "roc_auc",
     "ks_statistic", "recall_at_fpr", "lift_at_top_pct", "expected_calibration_error",
 ]

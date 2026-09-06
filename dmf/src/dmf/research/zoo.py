@@ -38,10 +38,27 @@ def import_object(dotted: str) -> Any:
 
 
 def _accepts(cls: Any, param: str) -> bool:
-    try:
-        return param in inspect.signature(cls.__init__).parameters
-    except (TypeError, ValueError):  # pragma: no cover
-        return False
+    """Whether ``cls(**{param: ...})`` is a real constructor argument.
+
+    Walks the class hierarchy rather than reading only ``cls.__init__``:
+    ``xgboost.XGBClassifier.__init__`` is declared as ``(self, *, objective,
+    **kwargs)`` and forwards everything to ``XGBModel``, where the actual
+    parameters live. Probing the subclass alone reports ``False`` for
+    ``scale_pos_weight``, ``random_state`` and ``n_jobs``, so the configured
+    imbalance policy and seed were silently never applied to XGBoost.
+    A constructor with an explicit signature and no ``**kwargs`` is
+    authoritative for its class, so the walk stops there.
+    """
+    for klass in inspect.getmro(cls):
+        try:
+            params = inspect.signature(klass.__init__).parameters
+        except (TypeError, ValueError):  # pragma: no cover
+            continue
+        if param in params:
+            return True
+        if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return False
+    return False
 
 
 def _imbalance_kwargs(cls: Any, spec: ModelSpec, y: Optional[np.ndarray]) -> Dict[str, Any]:

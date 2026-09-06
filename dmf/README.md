@@ -280,7 +280,17 @@ The champion's **decision threshold** is derived automatically from its holdout 
 distribution per `metrics.decision_threshold_policy` — `top_pct` (the cut flagging the
 top `lift_top_pct` of volume; default), `fpr` (the cut achieving `recall_at_fpr`
 false-positive rate), or `none` — and ships in `model.joblib` as `decision_threshold`,
-which `ProductionScorer.from_joblib` picks up as a stable absolute cut.
+which `ProductionScorer.from_joblib` picks up as a stable absolute cut. The value is stored
+at full precision: the scorer applies `score >= threshold`, and on a discrete score scale
+rounding it up by one unit in the sixth decimal would drop every row tied at the quantile.
+
+With `run.refit_on_full_data` the pipeline that ships is not the fit the holdout was
+scored on, so what ships beside it is re-derived from the production pipeline's own scores
+on the holdout rows: `reference_score_quantiles` always, and the `top_pct` threshold (a
+quantile of scores) too. An `fpr` threshold depends on labels the refit has now seen, so it
+keeps the train-only value. `decision_threshold_source` and `reference_score_source` in the
+bundle, the meta sidecar and `holdout_metrics.json` say which fit each number describes,
+and `decision_threshold_train_only` keeps the validated value for traceability.
 
 ---
 
@@ -362,8 +372,10 @@ the training envelope keep working when the model is nested.
 **Monitoring.** `population_stability_index(reference, current)` with `psi_band()`
 (< 0.10 stable, 0.10–0.25 watch, > 0.25 investigate) completes the picture: the guard
 catches values outside the support, PSI catches a shift *within* it. The bundle ships
-`reference_score_quantiles` from the holdout, so PSI runs in production without reloading
-the training table.
+`reference_score_quantiles` — the shipped pipeline's score distribution on the holdout
+rows — and `psi_from_reference_quantiles(bundle["reference_score_quantiles"], scores)`
+computes PSI from those quantiles alone, so it runs in production without the training
+table or the holdout.
 
 **Version skew.** The bundle records `dmf_version`; loading it under a different version
 warns, because custom transformers are pickled by reference and a renamed class is a
