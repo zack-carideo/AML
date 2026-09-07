@@ -37,8 +37,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_curve
 
-from ..config import MetricsConfig
-from ..metrics import evaluate_predictions, operating_point
+from ..metrics import as_metrics_config, evaluate_predictions, operating_point
 from ..reporting import json_safe
 
 #: columns of the long-format prediction table, in storage order
@@ -151,14 +150,30 @@ class PredictionLog:
 # --------------------------------------------------------------------------
 # artifact IO
 # --------------------------------------------------------------------------
-def _write_table(df: pd.DataFrame, path: Path) -> str:
+def read_table(path: Union[str, Path], **kwargs: Any) -> pd.DataFrame:
+    """CSV or Parquet, decided by the file extension."""
+    path = Path(path)
+    reader = pd.read_parquet if path.suffix == ".parquet" else pd.read_csv
+    return reader(path, **kwargs)
+
+
+def write_table(df: pd.DataFrame, stem: Path) -> str:
     """Parquet with a CSV fallback, returning the file name actually written."""
     try:
-        df.to_parquet(path.with_suffix(".parquet"), index=False)
-        return path.with_suffix(".parquet").name
-    except Exception:
-        df.to_csv(path.with_suffix(".csv"), index=False)
-        return path.with_suffix(".csv").name
+        df.to_parquet(stem.with_suffix(".parquet"), index=False)
+        return stem.with_suffix(".parquet").name
+    except Exception:                     # no parquet engine installed
+        df.to_csv(stem.with_suffix(".csv"), index=False)
+        return stem.with_suffix(".csv").name
+
+
+def _read_stored(run_dir: Union[str, Path], stem: str) -> Optional[pd.DataFrame]:
+    """Whichever of ``<stem>.parquet`` / ``<stem>.csv`` a run wrote, or None."""
+    for ext in (".parquet", ".csv"):
+        path = Path(run_dir) / f"{stem}{ext}"
+        if path.exists():
+            return read_table(path)
+    return None
 
 
 def write_prediction_artifacts(
@@ -177,10 +192,10 @@ def write_prediction_artifacts(
 
     preds = log.to_frame()
     if len(preds):
-        written["predictions"] = _write_table(preds, out / "predictions")
+        written["predictions"] = write_table(preds, out / "predictions")
     folds = log.fold_frame()
     if len(folds):
-        written["fold_assignments"] = _write_table(folds, out / "fold_assignments")
+        written["fold_assignments"] = write_table(folds, out / "fold_assignments")
 
     meta = dict(meta or {})
     meta["save_predictions"] = log.level
@@ -201,47 +216,53 @@ def load_predictions(run_dir: Union[str, Path]) -> Tuple[pd.DataFrame, Dict[str,
     ``run_report.json``). Raises with a pointer at ``run.save_predictions``
     when the run did not store predictions.
     """
-    p = Path(run_dir)
-    preds = None
-    for name in ("predictions.parquet", "predictions.csv"):
-        if (p / name).exists():
-            preds = pd.read_parquet(p / name) if name.endswith(".parquet") else pd.read_csv(p / name)
-            break
+    preds = _read_stored(run_dir, "predictions")
     if preds is None:
         raise FileNotFoundError(
-            f"No predictions.parquet/csv under '{p}'. The run was executed with "
+            f"No predictions.parquet/csv under '{run_dir}'. The run was executed with "
             f"run.save_predictions='none', or predates the prediction store."
         )
-    meta_path = p / "predictions_meta.json"
+    meta_path = Path(run_dir) / "predictions_meta.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
     return preds, meta
 
 
 def load_fold_assignments(run_dir: Union[str, Path]) -> pd.DataFrame:
-    p = Path(run_dir)
-    for name in ("fold_assignments.parquet", "fold_assignments.csv"):
-        if (p / name).exists():
-            return pd.read_parquet(p / name) if name.endswith(".parquet") else pd.read_csv(p / name)
-    raise FileNotFoundError(f"No fold_assignments.parquet/csv under '{p}'.")
+    folds = _read_stored(run_dir, "fold_assignments")
+    if folds is None:
+        raise FileNotFoundError(f"No fold_assignments.parquet/csv under '{run_dir}'.")
+    return folds
 
 
 # --------------------------------------------------------------------------
 # post-hoc evaluation
 # --------------------------------------------------------------------------
-def _as_metrics_cfg(m: Any) -> Any:
-    """Accept a MetricsConfig, a meta dict, or None (framework defaults)."""
-    if m is None:
-        return MetricsConfig()
-    if isinstance(m, MetricsConfig):
-        return m
-    if isinstance(m, dict):
-        if isinstance(m.get("metrics"), dict):     # a whole predictions_meta.json
-            m = m["metrics"]
-        from dataclasses import fields as dc_fields
+def _threshold_at_fpr(y: np.ndarray, s: np.ndarray, max_fpr: float) -> Tuple[Optional[float], Optional[float]]:
+    """``(score cut, recall)`` at a false-positive budget; ``(None, None)`` on a single-class target."""
+    if len(np.unique(y)) < 2:
+        return None, None
+    fpr, tpr, thr = roc_curve(y, s)
+    thr = np.where(np.isfinite(thr), thr, float(np.max(s)))   # sklearn's leading +inf
+    return float(np.interp(max_fpr, fpr, thr)), float(np.interp(max_fpr, fpr, tpr))
 
-        known = {f.name for f in dc_fields(MetricsConfig)}
-        return MetricsConfig(**{k: v for k, v in m.items() if k in known})
-    return m  # duck-typed, e.g. cfg.metrics
+
+def _confusion(y: np.ndarray, s: np.ndarray, threshold: float) -> Dict[str, Any]:
+    """Counts and rates of ``s >= threshold`` against ``y``."""
+    flag = s >= threshold
+    n, n_pos, n_flag = len(y), int(y.sum()), int(flag.sum())
+    tp = int(((y == 1) & flag).sum())
+    fp = n_flag - tp
+    precision = tp / n_flag if n_flag else None
+    recall = tp / n_pos if n_pos else None
+    return {
+        "n": n, "n_flagged": n_flag,
+        "flag_rate": round(n_flag / n, 6) if n else None,
+        "tp": tp, "fp": fp, "fn": n_pos - tp, "tn": (n - n_pos) - fp,
+        "precision": round(precision, 6) if precision is not None else None,
+        "recall": round(recall, 6) if recall is not None else None,
+        "fpr": round(fp / (n - n_pos), 6) if n - n_pos else None,
+        "f1": round(2 * precision * recall / (precision + recall), 6) if precision and recall else None,
+    }
 
 
 def _grouped(preds: pd.DataFrame, by: Iterable[str]):
@@ -267,7 +288,7 @@ def compute_metrics(
     for framework defaults. ``by`` controls granularity, e.g. add ``"fold"``
     for per-fold rows.
     """
-    cfg = _as_metrics_cfg(metrics_cfg)
+    cfg = as_metrics_config(metrics_cfg)
     rows = []
     for keys, key, g in _grouped(preds, by):
         row: Dict[str, Any] = dict(zip(keys, key))
@@ -292,18 +313,13 @@ def threshold_at_fpr(
     """
     rows = []
     for keys, key, g in _grouped(preds, by):
-        row: Dict[str, Any] = dict(zip(keys, key))
-        row.update(n=int(len(g)), n_positive=int(g["y_true"].sum()), max_fpr=float(max_fpr))
-        y = g["y_true"].to_numpy()
-        s = g["y_score"].to_numpy(dtype=float)
-        if len(np.unique(y)) < 2:
-            row.update(threshold=None, recall=None)
-        else:
-            fpr, tpr, thr = roc_curve(y, s)
-            thr = np.where(np.isfinite(thr), thr, float(np.max(s)))
-            row.update(threshold=round(float(np.interp(max_fpr, fpr, thr)), 6),
-                       recall=round(float(np.interp(max_fpr, fpr, tpr)), 6))
-        rows.append(row)
+        thr, recall = _threshold_at_fpr(g["y_true"].to_numpy(), g["y_score"].to_numpy(dtype=float), max_fpr)
+        rows.append({
+            **dict(zip(keys, key)),
+            "n": int(len(g)), "n_positive": int(g["y_true"].sum()), "max_fpr": float(max_fpr),
+            "threshold": None if thr is None else round(thr, 6),
+            "recall": None if recall is None else round(recall, 6),
+        })
     return pd.DataFrame(rows)
 
 
@@ -327,28 +343,8 @@ def operating_point_table(
     for keys, key, g in _grouped(preds, by):
         y = g["y_true"].to_numpy()
         s = g["y_score"].to_numpy(dtype=float)
-        n, n_pos = len(y), int(y.sum())
         for t in thresholds:
-            flag = s >= t
-            tp = int(((y == 1) & flag).sum())
-            fp = int(((y == 0) & flag).sum())
-            fn = n_pos - tp
-            tn = (n - n_pos) - fp
-            n_flag = tp + fp
-            precision = tp / n_flag if n_flag else None
-            recall = tp / n_pos if n_pos else None
-            rows.append({
-                **dict(zip(keys, key)),
-                "threshold": round(float(t), 6),
-                "n": n, "n_flagged": n_flag,
-                "flag_rate": round(n_flag / n, 6) if n else None,
-                "tp": tp, "fp": fp, "fn": fn, "tn": tn,
-                "precision": round(precision, 6) if precision is not None else None,
-                "recall": round(recall, 6) if recall is not None else None,
-                "fpr": round(fp / (n - n_pos), 6) if n - n_pos else None,
-                "f1": round(2 * precision * recall / (precision + recall), 6)
-                if precision and recall else None,
-            })
+            rows.append({**dict(zip(keys, key)), "threshold": round(float(t), 6), **_confusion(y, s, t)})
     return pd.DataFrame(rows)
 
 
@@ -360,7 +356,7 @@ def implied_thresholds(y_true, y_score, metrics_cfg: Any) -> Dict[str, Any]:
     threshold ships in the model bundle, so :class:`dmf.inference.ProductionScorer`
     applies a stable absolute cut instead of a batch-relative quantile.
     """
-    cfg = _as_metrics_cfg(metrics_cfg)
+    cfg = as_metrics_config(metrics_cfg)
     y = np.asarray(y_true).ravel().astype(int)
     s = np.asarray(y_score, dtype=float).ravel()
 
@@ -370,11 +366,7 @@ def implied_thresholds(y_true, y_score, metrics_cfg: Any) -> Dict[str, Any]:
     fpr_point = operating_point(cfg, "recall_at_fpr")
 
     thr_top = float(np.quantile(s, 1 - top_pct)) if top_pct else None
-    thr_fpr = None
-    if len(np.unique(y)) == 2:
-        fpr, _, thr = roc_curve(y, s)
-        thr = np.where(np.isfinite(thr), thr, float(np.max(s)))
-        thr_fpr = float(np.interp(fpr_point, fpr, thr))
+    thr_fpr, _ = _threshold_at_fpr(y, s, fpr_point)
 
     policy = getattr(cfg, "decision_threshold_policy", "top_pct")
     decision = {"top_pct": thr_top, "fpr": thr_fpr, "none": None}[policy]
@@ -397,18 +389,14 @@ def implied_thresholds(y_true, y_score, metrics_cfg: Any) -> Dict[str, Any]:
         "decision_threshold": decision,
     }
     if decision is not None:
-        flag = s >= decision
-        n_flag = int(flag.sum())
-        n_pos = int(y.sum())
-        tp = int(((y == 1) & flag).sum())
-        out["decision_flag_rate"] = round(n_flag / len(s), 6) if len(s) else None
-        out["decision_precision"] = round(tp / n_flag, 6) if n_flag else None
-        out["decision_recall"] = round(tp / n_pos, 6) if n_pos else None
+        c = _confusion(y, s, decision)
+        out.update(decision_flag_rate=c["flag_rate"], decision_precision=c["precision"],
+                   decision_recall=c["recall"])
     return out
 
 
 __all__ = [
-    "PredictionLog", "PREDICTION_COLUMNS",
+    "PredictionLog", "PREDICTION_COLUMNS", "read_table", "write_table",
     "write_prediction_artifacts", "load_predictions", "load_fold_assignments",
     "compute_metrics", "threshold_at_fpr", "operating_point_table", "implied_thresholds",
 ]

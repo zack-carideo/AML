@@ -15,9 +15,11 @@ auto-declined on the strength of an extrapolation the model never learned.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import joblib
 import numpy as np
 import pandas as pd
 
@@ -61,9 +63,7 @@ class ProductionScorer:
     # ------------------------------------------------------------------
     @classmethod
     def from_joblib(cls, path: str | Path, **kwargs: Any) -> "ProductionScorer":
-        """Load a bundle written by :class:`dmf.selection.ModelSelectionHarness`."""
-        import joblib
-
+        """Load a bundle written by :class:`dmf.research.selection.ModelSelectionHarness`."""
         bundle = joblib.load(path)
         if not (isinstance(bundle, dict) and "pipeline" in bundle):
             return cls(bundle, **kwargs)
@@ -102,7 +102,7 @@ class ProductionScorer:
         extra = [c for c in present if c not in required]
         return {
             "n_required": len(required),
-            "n_present": len([c for c in required if c in present]),
+            "n_present": len(required) - len(missing),
             "missing_columns": missing,
             "extra_columns_ignored": extra[:50],
             "n_extra_ignored": len(extra),
@@ -137,7 +137,6 @@ class ProductionScorer:
         # than scraped off estimator state, so it is right under concurrency and
         # right when a calibrator or threshold tuner ran predict_proba on clones.
         _, report, flags = feats.transform_with_quality(X)
-        flags = flags.set_axis(X.index)
 
         out = pd.DataFrame({"fraud_probability": proba}, index=X.index)
         out["score_rank"] = out["fraud_probability"].rank(ascending=False, method="first").astype(int)
@@ -258,11 +257,9 @@ def _find_feature_step(obj: Any, depth: int = 0) -> Optional[DisputeFeaturePipel
 
 def _warn_on_version_skew(saved: Optional[str]) -> None:
     """A pickle is only valid against the code that defined its classes."""
-    from . import __version__
+    from . import __version__     # local: dmf/__init__ imports this module
 
     if saved and saved != __version__:
-        import warnings
-
         warnings.warn(
             f"Model was saved by dmf {saved} but dmf {__version__} is installed. "
             f"Custom transformers are pickled by reference; verify scores against a "
@@ -272,8 +269,4 @@ def _warn_on_version_skew(saved: Optional[str]) -> None:
         )
 
 
-def load_scorer(path: str | Path, **kwargs: Any) -> ProductionScorer:
-    return ProductionScorer.from_joblib(path, **kwargs)
-
-
-__all__ = ["ProductionScorer", "load_scorer"]
+__all__ = ["ProductionScorer"]

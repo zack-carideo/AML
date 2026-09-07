@@ -19,6 +19,7 @@ Design notes
 from __future__ import annotations
 
 import copy
+import functools
 import typing
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -33,47 +34,60 @@ T = TypeVar("T")
 # generic dataclass <-> dict plumbing
 # --------------------------------------------------------------------------
 def _dataclass_type(annotation: Any) -> Optional[type]:
-    """The dataclass a field nests, if any -- unwrapping Optional[X]."""
+    """The dataclass a field holds: directly, inside Optional[X], or as the
+    value type of Dict[str, X]."""
     if is_dataclass(annotation):
         return annotation  # type: ignore[return-value]
-    for arg in typing.get_args(annotation):
-        if is_dataclass(arg):
-            return arg
-    return None
+    return next((arg for arg in typing.get_args(annotation) if is_dataclass(arg)), None)
 
 
 def _from_dict(cls: Type[T], data: Optional[Dict[str, Any]], path: str = "") -> T:
     """Recursively build a (possibly nested) dataclass from a mapping.
 
     Field annotations are resolved with ``typing.get_type_hints`` rather than a
-    hand-maintained registry, so adding a new config section never requires
+    hand-maintained registry, so adding a new config section -- or a new
+    ``Dict[str, SomeSection]`` field like ``models`` -- never requires
     registering it anywhere.
     """
-    data = {} if data is None else dict(data)
-    if not is_dataclass(cls):
-        return data  # type: ignore[return-value]
-
+    data = dict(data or {})
     known = {f.name for f in fields(cls)}
     unknown = set(data) - known
     if unknown:
-        where = path or cls.__name__
         raise ValueError(
-            f"Unknown configuration key(s) {sorted(unknown)} under '{where}'. "
+            f"Unknown configuration key(s) {sorted(unknown)} under '{path or cls.__name__}'. "
             f"Valid keys: {sorted(known)}"
         )
 
     hints = typing.get_type_hints(cls)
     kwargs: Dict[str, Any] = {}
-    for name in known:
-        if name not in data:
-            continue
-        value = data[name]
-        nested = _dataclass_type(hints.get(name))
-        if nested is not None and isinstance(value, dict):
-            kwargs[name] = _from_dict(nested, value, f"{path}.{name}" if path else name)
+    for name, value in data.items():
+        hint = hints.get(name)
+        nested = _dataclass_type(hint)
+        where = f"{path}.{name}" if path else name
+        if nested is not None and typing.get_origin(hint) is dict:
+            kwargs[name] = {k: _from_dict(nested, v, f"{where}.{k}") for k, v in (value or {}).items()}
+        elif nested is not None and isinstance(value, dict):
+            kwargs[name] = _from_dict(nested, value, where)
         else:
             kwargs[name] = value
     return cls(**kwargs)  # type: ignore[return-value]
+
+
+def get_dotted(obj: Any, dotted: str) -> Any:
+    """``get_dotted(cfg, "split.cv.n_splits")`` -> ``cfg.split.cv.n_splits``."""
+    return functools.reduce(getattr, dotted.split("."), obj)
+
+
+def set_dotted(obj: Any, dotted: str, value: Any) -> None:
+    """Assign through a dotted path, refusing to invent keys that do not exist."""
+    *parents, leaf = dotted.split(".")
+    target = obj
+    for part in parents + [leaf]:
+        if not hasattr(target, part):
+            raise AttributeError(f"'{dotted}': no key '{part}' in {type(target).__name__}.")
+        if part != leaf:
+            target = getattr(target, part)
+    setattr(target, leaf, value)
 
 
 def _to_dict(obj: Any) -> Any:
@@ -397,13 +411,7 @@ class Config:
     # ---------------- construction ----------------
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Config":
-        data = copy.deepcopy(dict(data or {}))
-        models_raw = data.pop("models", {}) or {}
-        cfg = _from_dict(cls, data)
-        cfg.models = {
-            name: _from_dict(ModelSpec, spec, f"models.{name}")
-            for name, spec in models_raw.items()
-        }
+        cfg = _from_dict(cls, copy.deepcopy(dict(data or {})))
         cfg.validate()
         return cfg
 
@@ -411,6 +419,15 @@ class Config:
     def from_yaml(cls, path: str | Path) -> "Config":
         with open(path, "r") as fh:
             return cls.from_dict(yaml.safe_load(fh) or {})
+
+    @classmethod
+    def load(cls, source: Union["Config", Dict[str, Any], str, Path]) -> "Config":
+        """A Config from whatever a caller has: a Config, a mapping, or a YAML path."""
+        if isinstance(source, Config):
+            return source
+        if isinstance(source, dict):
+            return cls.from_dict(source)
+        return cls.from_yaml(source)
 
     def to_dict(self) -> Dict[str, Any]:
         return _to_dict(self)
@@ -447,15 +464,13 @@ class Config:
             _check_in(value, allowed, where)
         if g.numeric_tolerance < 0:
             raise ValueError("preprocessing.inference_guard.numeric_tolerance must be >= 0.")
-        for attr in ("recall_at_fpr", "lift_top_pct"):
-            _check_operating_points(getattr(self.metrics, attr), f"metrics.{attr}")
-        # resolving the metric set here turns an unknown metric name, or a
-        # primary that spans several operating points, into a config error
-        # rather than a failure an hour into a sweep. Imported locally so the
-        # config module stays free of a dependency on the metric registry.
-        from .metrics import resolve_metrics
+        # an unknown metric name, a bad operating point, or a primary that spans
+        # several operating points is a config error here rather than a failure
+        # an hour into a sweep. Imported locally so the config module stays free
+        # of a module-level dependency on the metric registry.
+        from .metrics import validate_metrics
 
-        resolve_metrics(self.metrics)
+        validate_metrics(self.metrics)
         if not 0.0 < self.columns.numeric_parse_threshold <= 1.0:
             raise ValueError("columns.numeric_parse_threshold must be in (0, 1].")
         if not 0.0 < self.columns.max_categorical_cardinality_ratio <= 1.0:
@@ -513,23 +528,10 @@ def _check_in(value: Any, allowed: set, where: str) -> None:
         raise ValueError(f"{where}='{value}' is invalid; expected one of {sorted(allowed)}.")
 
 
-def _check_operating_points(value: Any, where: str) -> None:
-    """A metric budget: one number in (0, 1], or a non-empty list of distinct ones."""
-    values = list(value) if isinstance(value, (list, tuple)) else [value]
-    if not values:
-        raise ValueError(f"{where} is an empty list; supply at least one value.")
-    for v in values:
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.0 < float(v) <= 1.0:
-            raise ValueError(
-                f"{where} must be a number in (0, 1] (or a list of them); got {v!r}."
-            )
-    if len({float(v) for v in values}) != len(values):
-        raise ValueError(f"{where} contains duplicate operating points: {values}.")
-
-
 __all__ = [
     "Config", "RunConfig", "DataConfig", "ColumnsConfig", "PreprocessingConfig",
     "InferenceGuardConfig",
     "NumericPreprocessing", "CategoricalPreprocessing", "SplitConfig", "CVConfig",
     "MetricsConfig", "SelectionConfig", "ModelSpec", "TuningConfig",
+    "get_dotted", "set_dotted",
 ]

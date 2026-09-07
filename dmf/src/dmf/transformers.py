@@ -35,6 +35,7 @@ and never see validation rows -- including the supervised WOE encoder.
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -72,7 +73,7 @@ def parse_kind(s: pd.Series, threshold: float = 0.95) -> Tuple[Optional[str], fl
     when at least ``threshold`` of its non-null values parse cleanly, so a
     mostly-numeric column with a few ``"N/A"`` sentinels still counts as numeric.
     """
-    if pd.api.types.is_bool_dtype(s) or pd.api.types.is_numeric_dtype(s):
+    if pd.api.types.is_numeric_dtype(s):          # bool counts as numeric
         return "numeric", 1.0
     if pd.api.types.is_datetime64_any_dtype(s):
         return "datetime", 1.0
@@ -109,7 +110,7 @@ def to_numeric_lenient(s: pd.Series, kind: Optional[str] = None) -> pd.Series:
 
     # numeric dtype first, which makes this function idempotent: a datetime
     # column already converted to epoch days must not be re-parsed as a date.
-    if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
+    if pd.api.types.is_numeric_dtype(s):
         out = s.astype("float64")
     elif kind == "datetime" or pd.api.types.is_datetime64_any_dtype(s):
         dt = s if pd.api.types.is_datetime64_any_dtype(s) else pd.to_datetime(
@@ -322,7 +323,7 @@ class NumericCoercer(_NamedMixin, BaseEstimator, TransformerMixin):
         out = frame_to_numeric(df, kinds)
         self.parse_rate_ = {str(c): float(out[c].notna().mean()) for c in df.columns}
         self.report_ = {
-            "transformer": "NumericCoercer",
+            "transformer": type(self).__name__,
             "n_columns": int(df.shape[1]),
             "mean_parse_rate": round(float(np.mean(list(self.parse_rate_.values()))), 6)
             if self.parse_rate_ else None,
@@ -369,7 +370,7 @@ class QuantileWinsorizer(_NamedMixin, BaseEstimator, TransformerMixin):
             clipped = (arr < self.lower_bounds_) | (arr > self.upper_bounds_)
         n_valid = np.isfinite(arr).sum()
         self.report_ = {
-            "transformer": "QuantileWinsorizer",
+            "transformer": type(self).__name__,
             "n_columns": int(df.shape[1]),
             "lower_quantile": self.lower_quantile,
             "upper_quantile": self.upper_quantile,
@@ -418,7 +419,7 @@ class RareCategoryCollapser(_NamedMixin, BaseEstimator, TransformerMixin):
                 "collapsed_mass": float(freq[~freq.index.isin(list(keep))].sum()),
             }
         self.report_ = {
-            "transformer": "RareCategoryCollapser",
+            "transformer": type(self).__name__,
             "min_frequency": self.min_frequency,
             "n_columns": int(df.shape[1]),
             "n_levels_in": int(sum(d["n_levels_in"] for d in detail.values())),
@@ -485,7 +486,7 @@ class WOEEncoder(_NamedMixin, BaseEstimator, TransformerMixin):
             self.iv_[str(col)] = float(((p - q) * woe).sum())
 
         self.report_ = {
-            "transformer": "WOEEncoder",
+            "transformer": type(self).__name__,
             "n_columns": int(df.shape[1]),
             "smoothing": s,
             "clip": self.clip,
@@ -543,16 +544,14 @@ class FrameSelector(_NativeFrameOutput, _NamedMixin, BaseEstimator, TransformerM
         self.raise_on_missing = raise_on_missing
 
     def fit(self, X, y=None):
-        df = ensure_frame(X)
+        df = self._record_names(X)
         cols = list(self.columns) if self.columns is not None else [str(c) for c in df.columns]
         missing = [c for c in cols if c not in df.columns]
         if missing and self.raise_on_missing:
             raise KeyError(f"FrameSelector: columns absent from input: {missing}")
         self.columns_ = [c for c in cols if c in df.columns]
-        self.feature_names_in_ = np.asarray([str(c) for c in df.columns], dtype=object)
-        self.n_features_in_ = df.shape[1]
         self.report_ = {
-            "transformer": "FrameSelector",
+            "transformer": type(self).__name__,
             "n_columns_in": int(df.shape[1]),
             "n_columns_selected": int(len(self.columns_)),
             "dropped": [c for c in df.columns if c not in self.columns_][:50],
@@ -669,7 +668,7 @@ class InferenceGuard(_NativeFrameOutput, _NamedMixin, BaseEstimator, Transformer
         }
 
         self.report_ = {
-            "transformer": "InferenceGuard",
+            "transformer": type(self).__name__,
             "numeric_policy": self.numeric_policy,
             "unseen_category_policy": self.unseen_category_policy,
             "numeric_tolerance": self.numeric_tolerance,
@@ -710,8 +709,6 @@ class InferenceGuard(_NativeFrameOutput, _NamedMixin, BaseEstimator, Transformer
 
         report = self._batch_report(flags, detail, missing_cols, len(required))
         if self.warn and not report["batch_safe"]:
-            import warnings
-
             warnings.warn(
                 f"InferenceGuard: {report['escalation_reason']}; "
                 f"{report['n_rows_flagged']} of {len(df)} rows flagged. "

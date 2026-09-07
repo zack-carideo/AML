@@ -14,7 +14,7 @@ the final holdout report are computed by the same code.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -27,6 +27,26 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
+
+from .config import MetricsConfig
+
+
+def as_metrics_config(m: Any) -> Any:
+    """Accept whatever a caller has for the metrics section.
+
+    A ``MetricsConfig``; ``None`` for framework defaults; the ``metrics``
+    section as a dict (``bundle["config"]["metrics"]``); or a whole
+    ``predictions_meta.json`` dict, which carries that section under
+    ``"metrics"``. Anything else is returned as-is and duck-typed.
+    """
+    if m is None:
+        return MetricsConfig()
+    if isinstance(m, dict):
+        if isinstance(m.get("metrics"), dict):
+            m = m["metrics"]
+        known = {f.name for f in fields(MetricsConfig)}
+        return MetricsConfig(**{k: v for k, v in m.items() if k in known})
+    return m
 
 
 # --------------------------------------------------------------------------
@@ -61,19 +81,17 @@ def roc_auc(y_true, y_score) -> float:
 
 def ks_statistic(y_true, y_score) -> float:
     """Kolmogorov-Smirnov separation: max(TPR - FPR) over all thresholds."""
-    y_true = np.asarray(y_true).ravel()
-    if len(np.unique(y_true)) < 2:
+    if not _has_both_classes(y_true):
         return float("nan")
-    fpr, tpr, _ = roc_curve(y_true, np.asarray(y_score).ravel())
+    fpr, tpr, _ = roc_curve(np.asarray(y_true).ravel(), np.asarray(y_score).ravel())
     return float(np.max(tpr - fpr))
 
 
 def recall_at_fpr(y_true, y_score, max_fpr: float = 0.01) -> float:
     """Detection rate at a fixed false-positive rate (analyst-capacity proxy)."""
-    y_true = np.asarray(y_true).ravel()
-    if len(np.unique(y_true)) < 2:
+    if not _has_both_classes(y_true):
         return float("nan")
-    fpr, tpr, _ = roc_curve(y_true, np.asarray(y_score).ravel())
+    fpr, tpr, _ = roc_curve(np.asarray(y_true).ravel(), np.asarray(y_score).ravel())
     return float(np.interp(max_fpr, fpr, tpr))
 
 
@@ -113,11 +131,11 @@ def expected_calibration_error(y_true, y_score, n_bins: int = 10) -> float:
 # --------------------------------------------------------------------------
 # registry
 # --------------------------------------------------------------------------
+@dataclass(frozen=True)
 class MetricDef:
-    def __init__(self, fn: Callable[..., float], greater_is_better: bool, needs: Optional[str] = None):
-        self.fn = fn
-        self.greater_is_better = greater_is_better
-        self.needs = needs  # config attribute supplying the operating point
+    fn: Callable[..., float]
+    greater_is_better: bool
+    needs: Optional[str] = None      # config attribute supplying the operating point
 
 
 METRIC_REGISTRY: Dict[str, MetricDef] = {
@@ -171,9 +189,18 @@ class ResolvedMetric:
         return float(self.spec.fn(y_true, y_score, **self.kwargs))
 
 
+def _as_list(value: Any) -> List[Any]:
+    """A configured operating point is a scalar or a list; treat both as a list."""
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
 def format_operating_point(value: float) -> str:
     """Render an operating point for use inside a metric name."""
     return f"{float(value):g}"
+
+
+def _suffixed(base: str, value: float) -> str:
+    return f"{base}{OPERATING_POINT_SEP}{format_operating_point(value)}"
 
 
 def split_metric_name(name: str) -> Tuple[str, Optional[float]]:
@@ -198,8 +225,7 @@ def operating_point(metrics_cfg: Any, attr: str) -> float:
     value, so the list is ordered by intent: lead with the budget the model is
     actually going to run at, and put the sensitivities behind it.
     """
-    value = getattr(metrics_cfg, attr)
-    values = list(value) if isinstance(value, (list, tuple)) else [value]
+    values = _as_list(getattr(as_metrics_config(metrics_cfg), attr))
     if not values:
         raise ValueError(f"metrics.{attr} is an empty list; supply at least one value.")
     return float(values[0])
@@ -229,19 +255,12 @@ def resolve_metric(name: str, metrics_cfg: Any) -> List[ResolvedMetric]:
 
     kwarg = _NEEDS_KWARG[spec.needs]
     if explicit is not None:
-        return [ResolvedMetric(f"{base}{OPERATING_POINT_SEP}{format_operating_point(explicit)}",
-                               base, {kwarg: explicit})]
+        return [ResolvedMetric(_suffixed(base, explicit), base, {kwarg: explicit})]
 
     configured = getattr(metrics_cfg, spec.needs)
     if not isinstance(configured, (list, tuple)):
         return [ResolvedMetric(base, base, {kwarg: float(configured)})]
-    if not len(configured):
-        raise ValueError(f"metrics.{spec.needs} is an empty list; supply at least one value.")
-    return [
-        ResolvedMetric(f"{base}{OPERATING_POINT_SEP}{format_operating_point(v)}",
-                       base, {kwarg: float(v)})
-        for v in configured
-    ]
+    return [ResolvedMetric(_suffixed(base, v), base, {kwarg: float(v)}) for v in configured]
 
 
 def resolve_metrics(metrics_cfg: Any) -> List[ResolvedMetric]:
@@ -252,6 +271,7 @@ def resolve_metrics(metrics_cfg: Any) -> List[ResolvedMetric]:
     report and the leaderboard columns are all built from this one list, so
     they cannot disagree about the set or the order.
     """
+    metrics_cfg = as_metrics_config(metrics_cfg)
     primary = resolve_metric(metrics_cfg.primary, metrics_cfg)
     if len(primary) > 1:
         raise ValueError(
@@ -275,6 +295,26 @@ def metric_names(metrics_cfg: Any) -> List[str]:
     return [m.name for m in resolve_metrics(metrics_cfg)]
 
 
+def validate_metrics(metrics_cfg: Any) -> None:
+    """Everything ``Config.validate`` needs to know about the metrics section.
+
+    Each operating point is a number in (0, 1], or a non-empty list of distinct
+    ones; and the configured names must resolve (known metric, and a primary
+    that names exactly one column).
+    """
+    for attr in ("recall_at_fpr", "lift_top_pct"):
+        where = f"metrics.{attr}"
+        values = _as_list(getattr(metrics_cfg, attr))
+        if not values:
+            raise ValueError(f"{where} is an empty list; supply at least one value.")
+        for v in values:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0.0 < float(v) <= 1.0:
+                raise ValueError(f"{where} must be a number in (0, 1] (or a list of them); got {v!r}.")
+        if len({float(v) for v in values}) != len(values):
+            raise ValueError(f"{where} contains duplicate operating points: {values}.")
+    resolve_metrics(metrics_cfg)
+
+
 def make_scorers(metrics_cfg: Any) -> Dict[str, Any]:
     """Build the ``scoring`` dict for ``cross_validate``.
 
@@ -293,6 +333,17 @@ def make_scorers(metrics_cfg: Any) -> Dict[str, Any]:
     }
 
 
+def _compute_all(y_true, y_score, metrics_cfg: Any) -> Dict[str, float]:
+    """Every configured metric in natural units; NaN where one cannot be computed."""
+    out: Dict[str, float] = {}
+    for m in resolve_metrics(metrics_cfg):
+        try:
+            out[m.name] = m.compute(y_true, y_score)
+        except Exception:
+            out[m.name] = float("nan")
+    return out
+
+
 def score_vector(y_true, y_score, metrics_cfg: Any, signed: bool = False) -> Dict[str, float]:
     """Every configured metric computed from one probability vector.
 
@@ -300,23 +351,17 @@ def score_vector(y_true, y_score, metrics_cfg: Any, signed: bool = False) -> Dic
     negated), so values are interchangeable with what ``make_scorers`` produces
     inside ``cross_validate`` -- the harness computes ``predict_proba`` once and
     derives all metrics from it instead of re-predicting once per scorer.
-    A metric that cannot be computed on a fold is missing, not zero.
+    A metric that cannot be computed on a fold is NaN, not zero.
     """
-    out: Dict[str, float] = {}
-    for m in resolve_metrics(metrics_cfg):
-        try:
-            v = m.compute(y_true, y_score)
-        except Exception:
-            v = float("nan")
-        if signed and not m.greater_is_better and np.isfinite(v):
-            v = -v
-        out[m.name] = v
+    out = _compute_all(y_true, y_score, metrics_cfg)
+    if signed:
+        out = {k: -v if np.isfinite(v) and not greater_is_better(k) else v for k, v in out.items()}
     return out
 
 
 def orient(name: str, value: float) -> float:
     """Convert a signed sklearn CV score back to its natural units."""
-    return -value if not greater_is_better(name) else value
+    return value if greater_is_better(name) else -value
 
 
 def greater_is_better(name: str) -> bool:
@@ -330,12 +375,7 @@ def greater_is_better(name: str) -> bool:
 # --------------------------------------------------------------------------
 def evaluate_predictions(y_true, y_score, metrics_cfg: Any) -> Dict[str, float]:
     """All configured metrics in natural units, plus calibration diagnostics."""
-    out: Dict[str, float] = {}
-    for m in resolve_metrics(metrics_cfg):
-        try:
-            out[m.name] = m.compute(y_true, y_score)
-        except Exception:
-            out[m.name] = float("nan")
+    out = _compute_all(y_true, y_score, metrics_cfg)
     y_true = np.asarray(y_true).ravel().astype(float)
     y_score = np.asarray(y_score).ravel()
     out["prevalence"] = float(y_true.mean())
@@ -490,7 +530,7 @@ def psi_band(psi: float) -> str:
 __all__ = [
     "METRIC_REGISTRY", "make_scorers", "orient", "greater_is_better",
     "MetricDef", "ResolvedMetric", "OPERATING_POINT_SEP",
-    "resolve_metric", "resolve_metrics", "metric_names",
+    "resolve_metric", "resolve_metrics", "metric_names", "validate_metrics", "as_metrics_config",
     "split_metric_name", "format_operating_point", "operating_point",
     "evaluate_predictions", "score_vector", "decile_table",
     "population_stability_index", "psi_from_reference_quantiles", "psi_band",

@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -45,6 +46,7 @@ from sklearn.model_selection import (
     train_test_split,
 )
 
+from .. import __version__
 from ..config import Config, ModelSpec
 from ..metrics import (
     decile_table,
@@ -62,7 +64,7 @@ from ..reporting import StepReport, json_safe, run_lineage, summarize_frame, sum
 from ..transformers import infer_roles
 from .evaluate import PredictionLog, implied_thresholds, write_prediction_artifacts
 from .ordering import rank_variables
-from .zoo import build_estimator, config_for_model
+from .zoo import build_zoo
 
 
 @dataclass
@@ -106,7 +108,6 @@ class ModelSelectionHarness:
         self.config = config
         self.report = StepReport(run=config.run.name)
         self.groups_tr_: Optional[np.ndarray] = None
-        self._orderings_cache: Dict[str, Any] = {}
         self.predictions_ = PredictionLog(config.run.save_predictions)
         self.row_ids_: Optional[np.ndarray] = None
         self.row_ids_tr_: Optional[np.ndarray] = None
@@ -396,23 +397,12 @@ class ModelSelectionHarness:
     # step 2: zoo + orderings
     # ------------------------------------------------------------------
     def _instantiate_zoo(self, y_tr: np.ndarray) -> Dict[str, Dict[str, Any]]:
-        cfg = self.config
-        zoo: Dict[str, Dict[str, Any]] = {}
-        skipped = {}
-        for name, spec in cfg.enabled_models.items():
-            try:
-                est = build_estimator(spec, cfg.run.random_state, cfg.run.n_jobs, y_tr)
-            except ImportError as exc:
-                skipped[name] = str(exc).split(".")[0]
-                continue
-            model_cfg = config_for_model(cfg, spec)
+        zoo, skipped = build_zoo(self.config, y_tr)
+        for entry in zoo.values():
             # A validation fold routinely contains category levels the training
             # folds did not, so guard warnings during the sweep are noise. The
-            # production refit below restores the configured setting.
-            model_cfg.preprocessing.inference_guard.warn = False
-            zoo[name] = {"spec": spec, "estimator": est, "config": model_cfg}
-        if not zoo:
-            raise RuntimeError("No estimators could be instantiated from the configured zoo.")
+            # production refit restores the configured setting.
+            entry["config"].preprocessing.inference_guard.warn = False
         self.report.add(
             "estimator_zoo",
             n_models=len(zoo),
@@ -463,7 +453,6 @@ class ModelSelectionHarness:
                 top5_jaccard=agreement["top5_jaccard"],
                 per_model_top5={k: v["ordering"][:5] for k, v in orderings.items()},
             )
-        self._orderings_cache = orderings
         return orderings
 
     # ------------------------------------------------------------------
@@ -480,7 +469,7 @@ class ModelSelectionHarness:
         cv = self._cv()
         t0 = time.time()
 
-        rows, fold_scores = self._grid_nested(X_tr, y_tr, zoo, candidates, cv)
+        rows, fold_scores = self._grid_nested(X_tr, y_tr, zoo, orderings, candidates, cv)
 
         leaderboard = pd.DataFrame(rows)
         leaderboard = leaderboard.sort_values(
@@ -508,7 +497,7 @@ class ModelSelectionHarness:
         )
         return leaderboard, fold_scores
 
-    def _grid_nested(self, X_tr, y_tr, zoo, candidates, cv):
+    def _grid_nested(self, X_tr, y_tr, zoo, orderings, candidates, cv):
         """Re-rank the variables inside every fold, then score the k-subsets.
 
         This measures the *procedure* -- "rank the variables, keep the top k,
@@ -552,17 +541,13 @@ class ModelSelectionHarness:
 
         # the reported variable list is the one the full training partition
         # chooses; the *score* beside it is the nested estimate above
-        full_orderings = {m: e["ordering"] for m, e in
-                          ((m, self._orderings_cache[m]) for m in zoo)}
         rows, fold_scores = [], {}
         for (model_name, k), cell in cells.items():
             cvres = {key: np.asarray(vals, dtype=float) for key, vals in cell.items()}
-            features = full_orderings[model_name][:k]
+            features = orderings[model_name]["ordering"][:k]
             rows.append(self._row_from_cv(model_name, zoo[model_name]["spec"], k, features,
                                           cvres, primary))
-            fold_scores[(model_name, k)] = np.asarray(
-                [orient(primary, v) for v in cvres[f"test_{primary}"]], dtype=float
-            )
+            fold_scores[(model_name, k)] = _oriented(cvres, primary)
 
         self.report.add(
             "selection_stability",
@@ -633,7 +618,7 @@ class ModelSelectionHarness:
             "fit_seconds": round(float(np.nanmean(cvres["fit_time"])), 4),
         }
         for name in metric_names(cfg.metrics):
-            test = np.asarray([orient(name, v) for v in cvres[f"test_{name}"]], dtype=float)
+            test = _oriented(cvres, name)
             row[f"cv_{name}_mean"] = round(float(np.nanmean(test)), 6)
             row[f"cv_{name}_std"] = round(float(np.nanstd(test, ddof=1)), 6) if len(test) > 1 else 0.0
             # Nadeau-Bengio corrected SE, not std/sqrt(n): folds share training
@@ -723,6 +708,7 @@ class ModelSelectionHarness:
             raise RuntimeError("Every grid cell failed to score; check the estimator zoo and data.")
 
         ranked = lb.sort_values(mean_col, ascending=asc, kind="mergesort")
+        best_row = ranked.iloc[0]
         if cfg.selection.top_n_distinct_models:
             ranked = ranked.drop_duplicates(subset="model", keep="first")
         top = ranked.head(cfg.selection.top_n)
@@ -744,7 +730,6 @@ class ModelSelectionHarness:
         idx = lb.groupby("model")[mean_col].idxmax() if not asc else lb.groupby("model")[mean_col].idxmin()
         best_per_model = lb.loc[idx].sort_values(mean_col, ascending=asc).reset_index(drop=True)
 
-        best_row = lb.sort_values(mean_col, ascending=asc, kind="mergesort").iloc[0]
         rule = "argmax"
         chosen = best_row
         if cfg.selection.one_se_rule:
@@ -839,9 +824,7 @@ class ModelSelectionHarness:
             )
             spec_copy = ModelSpec(**{**entry["spec"].__dict__, "tag": f"{entry['spec'].tag}+tuned"})
             new_rows.append(self._row_from_cv(tuned_name, spec_copy, k, features, cvres, primary))
-            fold_scores[(tuned_name, k)] = np.asarray(
-                [orient(primary, v) for v in cvres[f"test_{primary}"]], dtype=float
-            )
+            fold_scores[(tuned_name, k)] = _oriented(cvres, primary)
             zoo[tuned_name] = {"spec": spec_copy, "estimator": tuned_est, "config": entry["config"]}
             orderings[tuned_name] = orderings[model_name]
             tuned_summary.append({
@@ -1050,6 +1033,11 @@ class ModelSelectionHarness:
     # ------------------------------------------------------------------
     # step 8: artifacts
     # ------------------------------------------------------------------
+    #: holdout_metrics keys describing the shipped cut and monitoring reference,
+    #: copied into both the prediction-store sidecar and the model bundle
+    _SHIPPED_KEYS = ("decision_threshold", "decision_threshold_policy",
+                     "decision_threshold_source", "reference_score_source")
+
     def _write_artifacts(self, result: SelectionResult) -> None:
         cfg = self.config
         out = Path(cfg.run.output_dir) / cfg.run.name
@@ -1079,6 +1067,8 @@ class ModelSelectionHarness:
             ndigits = None if name == "holdout_metrics.json" else 6
             (out / name).write_text(json.dumps(json_safe(payload, ndigits=ndigits), indent=2))
 
+        hm = result.holdout_metrics
+        shipped = {k: hm.get(k) for k in self._SHIPPED_KEYS}
         lineage = self.report.get("lineage") or {}
         written = write_prediction_artifacts(out, self.predictions_, meta={
             "run": cfg.run.name,
@@ -1094,12 +1084,9 @@ class ModelSelectionHarness:
             "cv": {"strategy": cfg.split.strategy, "n_splits": cfg.split.cv.n_splits,
                    "n_repeats": cfg.split.cv.n_repeats},
             "metrics": cfg.to_dict()["metrics"],
-            "decision_threshold": result.holdout_metrics.get("decision_threshold"),
-            "decision_threshold_policy": result.holdout_metrics.get("decision_threshold_policy"),
-            "decision_threshold_source": result.holdout_metrics.get("decision_threshold_source"),
-            "reference_score_source": result.holdout_metrics.get("reference_score_source"),
-            "implied_threshold_top_pct": result.holdout_metrics.get("implied_threshold_top_pct"),
-            "implied_threshold_at_fpr": result.holdout_metrics.get("implied_threshold_at_fpr"),
+            **shipped,
+            "implied_threshold_top_pct": hm.get("implied_threshold_top_pct"),
+            "implied_threshold_at_fpr": hm.get("implied_threshold_at_fpr"),
         })
         if written:
             self.report.add(
@@ -1110,61 +1097,53 @@ class ModelSelectionHarness:
             )
         self.report.to_json(str(out / "run_report.json"))
 
-        # a config that reproduces exactly the winning specification
-        final_cfg = cfg.copy()
-        final_cfg.run.name = f"{cfg.run.name}__final"
-        final_cfg.models = {result.selected_model.replace("__tuned", ""):
-                            cfg.models.get(result.selected_model.replace("__tuned", ""), ModelSpec())}
-        roles = result.fitted_model.named_steps["features"].roles_
-        final_cfg.columns.numeric = list(roles.numeric)
-        final_cfg.columns.categorical = list(roles.categorical)
-        final_cfg.columns.passthrough = list(roles.passthrough)
-        final_cfg.columns.auto_infer = False        # the variable list is now explicit
-        k = int(result.selected["k"])
-        final_cfg.selection.k_min = final_cfg.selection.k_max = k
-        final_cfg.selection.top_n = 1
-        final_cfg.tuning.enabled = False
-        final_cfg.to_yaml(out / "final_spec.yaml")
-
+        self._write_final_spec(out, result)
         if cfg.run.save_fitted_model and result.fitted_model is not None:
-            try:
-                import joblib
-
-                from .. import __version__
-
-                joblib.dump(
-                    {"pipeline": result.fitted_model,
-                     "features": result.selected_features,
-                     "model": result.selected_model,
-                     "config": cfg.to_dict(),
-                     "dmf_version": __version__,
-                     # derived from the champion's holdout score distribution
-                     # per metrics.decision_threshold_policy; ProductionScorer
-                     # picks it up on load. None only when the policy is 'none'
-                     # (or the holdout was degenerate) -- the scorer then falls
-                     # back to a batch-relative cut.
-                     "decision_threshold": result.holdout_metrics.get("decision_threshold"),
-                     "decision_threshold_policy": result.holdout_metrics.get(
-                         "decision_threshold_policy"),
-                     # which fit the threshold and the monitoring reference
-                     # describe: the shipped refit where possible, otherwise
-                     # the train-only fit (see _shipped_reference)
-                     "decision_threshold_source": result.holdout_metrics.get(
-                         "decision_threshold_source"),
-                     "reference_score_source": result.holdout_metrics.get(
-                         "reference_score_source"),
-                     # reference distribution for PSI monitoring, so drift can be
-                     # measured in production without reloading the training table
-                     "reference_score_quantiles": result.holdout_metrics.get(
-                         "reference_score_quantiles"),
-                     "lineage": (self.report.get("lineage") or {})},
-                    out / "model.joblib",
-                )
-            except Exception as exc:  # pragma: no cover
-                print(f"[artifacts] could not persist model: {exc}")
+            self._write_bundle(out, result, shipped, lineage)
 
         self.report.add("artifacts", output_dir=str(out),
                         files=sorted(p.name for p in out.iterdir()))
+
+    def _write_final_spec(self, out: Path, result: SelectionResult) -> None:
+        """``final_spec.yaml``: a config that reproduces exactly the winning specification."""
+        cfg = self.config
+        base_model = result.selected_model.replace("__tuned", "")
+        final = cfg.copy()
+        final.run.name = f"{cfg.run.name}__final"
+        final.models = {base_model: cfg.models.get(base_model, ModelSpec())}
+        roles = result.fitted_model.named_steps["features"].roles_
+        final.columns.numeric = list(roles.numeric)
+        final.columns.categorical = list(roles.categorical)
+        final.columns.passthrough = list(roles.passthrough)
+        final.columns.auto_infer = False        # the variable list is now explicit
+        final.selection.k_min = final.selection.k_max = int(result.selected["k"])
+        final.selection.top_n = 1
+        final.tuning.enabled = False
+        final.to_yaml(out / "final_spec.yaml")
+
+    def _write_bundle(self, out: Path, result: SelectionResult,
+                      shipped: Dict[str, Any], lineage: Dict[str, Any]) -> None:
+        """``model.joblib``: the pipeline plus what ProductionScorer and a
+        monitoring job need to use it without the training table."""
+        try:
+            joblib.dump(
+                {"pipeline": result.fitted_model,
+                 "features": result.selected_features,
+                 "model": result.selected_model,
+                 "config": self.config.to_dict(),
+                 "dmf_version": __version__,
+                 # the cut ProductionScorer applies on load (None only under
+                 # policy 'none' or a degenerate holdout, when the scorer falls
+                 # back to a batch-relative cut) and which fit it and the
+                 # monitoring reference describe -- see _shipped_reference
+                 **shipped,
+                 # reference distribution for PSI monitoring in production
+                 "reference_score_quantiles": result.holdout_metrics.get("reference_score_quantiles"),
+                 "lineage": lineage},
+                out / "model.joblib",
+            )
+        except Exception as exc:  # pragma: no cover
+            print(f"[artifacts] could not persist model: {exc}")
 
 
 # --------------------------------------------------------------------------
@@ -1177,6 +1156,11 @@ def _safe_proba(pipe, X) -> Optional[np.ndarray]:
         return np.asarray(pipe.predict_proba(X))[:, 1]
     except Exception:
         return None
+
+
+def _oriented(cvres: Dict[str, np.ndarray], name: str) -> np.ndarray:
+    """Per-fold validation scores for ``name`` in natural units (signed convention undone)."""
+    return np.asarray([orient(name, v) for v in cvres[f"test_{name}"]], dtype=float)
 
 
 def _binarize_target(y: pd.Series, positive_label: Any) -> Tuple[np.ndarray, Any]:

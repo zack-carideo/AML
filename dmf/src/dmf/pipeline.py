@@ -104,14 +104,7 @@ class DisputeFeaturePipeline(BaseEstimator, TransformerMixin):
     # role resolution
     # ------------------------------------------------------------------
     def _resolve_config(self) -> Config:
-        cfg = self.config
-        if cfg is None:
-            return Config()
-        if isinstance(cfg, Config):
-            return cfg
-        if isinstance(cfg, dict):
-            return Config.from_dict(cfg)
-        raise TypeError("config must be a Config, a dict, or None.")
+        return Config() if self.config is None else Config.load(self.config)
 
     # ------------------------------------------------------------------
     # construction
@@ -228,10 +221,24 @@ class DisputeFeaturePipeline(BaseEstimator, TransformerMixin):
     # sklearn API
     # ------------------------------------------------------------------
     def fit(self, X, y=None):
+        self._fit(X, y)
+        return self
+
+    def fit_transform(self, X, y=None, **fit_params):
+        """Return the matrix produced during fitting, not a second transform.
+
+        For ``TargetEncoder`` these differ: the fit-time matrix is the
+        cross-fitted (out-of-fold) encoding the estimator must be trained on,
+        while ``transform`` yields the full-data per-level mean. Handing the
+        latter to the model is a leak that costs real out-of-sample AUC.
+        """
+        return self._fit(X, y)
+
+    def _fit(self, X, y) -> pd.DataFrame:
+        """Fit every step and return the fit-time design matrix."""
         cfg = self._resolve_config()
         df = ensure_frame(X)
         roles = infer_roles(df, cfg, self.features)
-        num, cat, pas = roles.numeric, roles.categorical, roles.passthrough
         if not roles.all:
             raise ValueError(
                 "No usable feature columns after role resolution. "
@@ -252,10 +259,7 @@ class DisputeFeaturePipeline(BaseEstimator, TransformerMixin):
         self.pipeline_ = self._build(cfg, roles)
         Xt = self.pipeline_.fit_transform(df, y)
 
-        self.numeric_features_ = num
-        self.categorical_features_ = cat
-        self.passthrough_features_ = pas
-        self.input_features_ = num + cat + pas
+        self.input_features_ = roles.all
         self.feature_names_in_ = np.asarray(self.input_features_, dtype=object)
         self.n_features_in_ = len(self.input_features_)
         self.feature_names_out_ = [str(c) for c in _feature_names(self.pipeline_, Xt)]
@@ -278,22 +282,9 @@ class DisputeFeaturePipeline(BaseEstimator, TransformerMixin):
 
         self.report_ = report
         self.fit_report_ = report.to_dict()
-        self._fit_output_ = Xt
         if self.verbose:
             print(report.render())
-        return self
-
-    def fit_transform(self, X, y=None, **fit_params):
-        """Return the matrix produced during fitting, not a second transform.
-
-        For ``TargetEncoder`` these differ: the fit-time matrix is the
-        cross-fitted (out-of-fold) encoding the estimator must be trained on,
-        while ``transform`` yields the full-data per-level mean. Handing the
-        latter to the model is a leak that costs real out-of-sample AUC.
-        """
-        self.fit(X, y)
-        out, self._fit_output_ = self._fit_output_, None
-        return out
+        return Xt
 
     def transform(self, X):
         check_is_fitted(self, "pipeline_")
@@ -329,12 +320,6 @@ class DisputeFeaturePipeline(BaseEstimator, TransformerMixin):
             raise KeyError(f"Required columns absent at transform time: {missing}")
         return X
 
-    # NOTE: fit_transform is deliberately NOT overridden. TransformerMixin's
-    # implementation returns the matrix produced *during* fitting, which for a
-    # cross-fitted supervised encoder (sklearn's TargetEncoder) is the
-    # out-of-fold encoding. Re-running transform() after fit would substitute
-    # the full-data per-level mean and train the estimator on a leaked column.
-
     def get_feature_names_out(self, input_features: Optional[Sequence[str]] = None) -> np.ndarray:
         check_is_fitted(self, "feature_names_out_")
         return np.asarray(self.feature_names_out_, dtype=object)
@@ -344,13 +329,12 @@ class DisputeFeaturePipeline(BaseEstimator, TransformerMixin):
     # ------------------------------------------------------------------
     def _build_source_map(self) -> Dict[str, str]:
         """Map every encoded output column back to the raw variable it came from."""
-        sources = {NUM: self.numeric_features_, CAT: self.categorical_features_, PASS: self.passthrough_features_}
+        r = self.roles_
+        sources = {NUM: r.numeric, CAT: r.categorical, PASS: r.passthrough}
         out: Dict[str, str] = {}
         for name in self.feature_names_out_:
             branch, _, inner = name.partition("__")
-            candidates = sources.get(branch, [])
-            if not candidates:
-                candidates = self.input_features_
+            candidates = sources.get(branch) or self.input_features_
             match = _longest_source_match(inner or name, candidates)
             out[name] = match if match is not None else (inner or name)
         return out

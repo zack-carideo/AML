@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from ..config import Config, ModelSpec
+from ..config import Config, ModelSpec, set_dotted
 
 
 def import_object(dotted: str) -> Any:
@@ -116,19 +116,25 @@ def build_estimator(
 
 def build_zoo(
     cfg: Config, y: Optional[np.ndarray] = None
-) -> Dict[str, Tuple[ModelSpec, Any]]:
-    """Instantiate every enabled model. Unimportable models are skipped loudly."""
-    zoo: Dict[str, Tuple[ModelSpec, Any]] = {}
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+    """Instantiate every enabled model with its per-model preprocessing view.
+
+    Returns ``(zoo, skipped)``: ``zoo`` maps each model name to
+    ``{"spec", "estimator", "config"}``; ``skipped`` names the models whose
+    library could not be imported, with the reason.
+    """
+    zoo: Dict[str, Dict[str, Any]] = {}
+    skipped: Dict[str, str] = {}
     for name, spec in cfg.enabled_models.items():
         try:
             est = build_estimator(spec, cfg.run.random_state, cfg.run.n_jobs, y)
         except ImportError as exc:
-            print(f"[zoo] skipping '{name}': {exc}")
+            skipped[name] = str(exc).split(".")[0]
             continue
-        zoo[name] = (spec, est)
+        zoo[name] = {"spec": spec, "estimator": est, "config": config_for_model(cfg, spec)}
     if not zoo:
         raise RuntimeError("No estimators could be instantiated from the configured zoo.")
-    return zoo
+    return zoo, skipped
 
 
 def config_for_model(cfg: Config, spec: ModelSpec) -> Config:
@@ -143,22 +149,12 @@ def config_for_model(cfg: Config, spec: ModelSpec) -> Config:
     if not spec.requires_scaling:
         out.preprocessing.numeric.scaler = "none"
     for dotted, value in (spec.preprocessing_overrides or {}).items():
-        _set_dotted(out.preprocessing, dotted, value)
+        try:
+            set_dotted(out.preprocessing, dotted, value)
+        except AttributeError as exc:
+            raise ValueError(f"models.{spec.estimator}.preprocessing_overrides: {exc}") from None
     out.validate()
     return out
-
-
-def _set_dotted(root: Any, dotted: str, value: Any) -> None:
-    parts = dotted.split(".")
-    obj = root
-    for p in parts[:-1]:
-        if not hasattr(obj, p):
-            raise ValueError(f"preprocessing_overrides: no such section '{p}' in '{dotted}'.")
-        obj = getattr(obj, p)
-    leaf = parts[-1]
-    if not hasattr(obj, leaf):
-        raise ValueError(f"preprocessing_overrides: no such key '{leaf}' in '{dotted}'.")
-    setattr(obj, leaf, value)
 
 
 __all__ = ["import_object", "build_estimator", "build_zoo", "config_for_model"]

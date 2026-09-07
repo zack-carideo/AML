@@ -16,14 +16,13 @@ second untouched partition for the final call.
 
 from __future__ import annotations
 
-import functools
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
-from ..config import Config
+from ..config import Config, get_dotted
 from .selection import ModelSelectionHarness, SelectionResult
 
 #: settings that must agree for two runs to share holdout rows and CV folds
@@ -37,16 +36,12 @@ COMPARABILITY_KEYS = [
 ]
 
 
-def _get(cfg: Config, dotted: str) -> Any:
-    return functools.reduce(getattr, dotted.split("."), cfg)
-
-
 def check_comparability(configs: List[Config]) -> Dict[str, List[Any]]:
     """Settings that differ across configs and would break like-for-like comparison."""
     return {
         key: values
         for key in COMPARABILITY_KEYS
-        if len(set(map(str, (values := [_get(c, key) for c in configs])))) > 1
+        if len(set(map(str, (values := [get_dotted(c, key) for c in configs])))) > 1
     }
 
 
@@ -63,7 +58,7 @@ def run_sweep(
     written under its own ``run.name``; the sweep adds one comparison table
     across them, keyed to holdout performance.
     """
-    cfgs = [c if isinstance(c, Config) else Config.from_yaml(c) for c in configs]
+    cfgs = [Config.load(c) for c in configs]
     for i, cfg in enumerate(cfgs):                    # unique artifact dirs
         if output_dir:
             cfg.run.output_dir = output_dir

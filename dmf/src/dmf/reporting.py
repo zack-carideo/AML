@@ -13,8 +13,11 @@ emits a machine-readable summary dict. Two rules keep these useful:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import platform
 from dataclasses import dataclass, field
+from importlib import metadata
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -29,17 +32,15 @@ def _num(x: Any, ndigits: Optional[int] = 6) -> Any:
     reference quantile -- must be written unrounded, or ties at the value are
     silently dropped by the ``>=`` the scorer applies.
     """
-    if x is None:
-        return None
-    if isinstance(x, (np.integer,)):
+    if isinstance(x, (float, np.floating)):
+        x = float(x)
+        if not np.isfinite(x):
+            return None
+        return round(x, ndigits) if ndigits is not None else x
+    if isinstance(x, np.integer):
         return int(x)
-    if isinstance(x, (np.floating,)):
-        v = float(x)
-        return None if not np.isfinite(v) else (round(v, ndigits) if ndigits is not None else v)
-    if isinstance(x, (np.bool_,)):
+    if isinstance(x, np.bool_):
         return bool(x)
-    if isinstance(x, float):
-        return None if not np.isfinite(x) else (round(x, ndigits) if ndigits is not None else x)
     return x
 
 
@@ -208,10 +209,6 @@ def run_lineage(config_dict: Dict[str, Any], df: Optional[pd.DataFrame] = None) 
     the training frame -- enough to answer "was this the same code, the same
     settings and the same data?" without keeping a copy of the data.
     """
-    import hashlib
-    import platform
-    from importlib import metadata
-
     versions = {}
     for pkg in ("numpy", "pandas", "scikit-learn", "scipy", "xgboost", "lightgbm"):
         try:

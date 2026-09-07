@@ -1,13 +1,14 @@
 """
-Command-line entry point.
+Command-line entry point: a printing shell over :mod:`dmf.research.api`.
 
-Two subcommands. ``train`` is the default, so the original invocation still
+Three subcommands. ``train`` is the default, so the original invocation still
 works::
 
-    python -m dmf.cli --config configs/dispute_fraud.yaml
-    python -m dmf.cli train --config configs/dispute_fraud.yaml --ordering rfe --tune
-    python -m dmf.cli score --model artifacts/dispute_fraud_v1/model.joblib \
-                            --data data/disputes_next_month.csv --out scored.csv
+    dmf --config configs/dispute_fraud.yaml
+    dmf train --config configs/dispute_fraud.yaml --ordering rfe --tune
+    dmf sweep --configs a.yaml b.yaml --output-dir artifacts
+    dmf score --model artifacts/dispute_fraud_v1/model.joblib \\
+              --data data/disputes_next_month.csv --out scored.csv
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ from pathlib import Path
 import pandas as pd
 
 from ..config import Config
-from .selection import ModelSelectionHarness
+from ..inference import ProductionScorer
+from .api import TRAIN_OVERRIDES, apply_overrides, run_sweep, score, train
 
 _SUBCOMMANDS = {"train", "score", "sweep"}
 
@@ -72,56 +74,13 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-# CLI flag -> dotted config path. Adding a train flag is one row here plus its
-# add_argument above; flags whose value needs interpretation are handled after
-# the loop.
-_OVERRIDES = {
-    "output_dir": "run.output_dir",
-    "name": "run.name",
-    "ordering": "selection.ordering_strategy",
-    "k_max": "selection.k_max",
-    "top_n": "selection.top_n",
-    "cv_splits": "split.cv.n_splits",
-    "metric": "metrics.primary",
-    "n_jobs": "run.n_jobs",
-    "seed": "run.random_state",
-}
-
-
-def _set_dotted(cfg: Config, dotted: str, value) -> None:
-    obj = cfg
-    *parents, leaf = dotted.split(".")
-    for part in parents:
-        obj = getattr(obj, part)
-    setattr(obj, leaf, value)
-
-
-def apply_overrides(cfg: Config, args: argparse.Namespace) -> Config:
-    for arg, dotted in _OVERRIDES.items():
-        value = getattr(args, arg, None)
-        if value is not None:
-            _set_dotted(cfg, dotted, value)
-    if args.data:
-        cfg.data.path = args.data
-        cfg.data.format = "parquet" if str(args.data).endswith(".parquet") else "csv"
-    if args.distinct_models:
-        cfg.selection.top_n_distinct_models = True
-    if args.tune:
-        cfg.tuning.enabled = True
-    if args.no_tune:
-        cfg.tuning.enabled = False
-    if args.quiet:
-        cfg.run.verbose = 0
-    cfg.validate()
-    return cfg
-
-
 # --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
 def cmd_train(args: argparse.Namespace) -> int:
-    cfg = apply_overrides(Config.from_yaml(args.config), args)
-    result = ModelSelectionHarness(cfg).run()
+    overrides = {k: v for k, v in vars(args).items() if k in TRAIN_OVERRIDES}
+    result = train(args.config, **overrides)
+    cfg = result.config
 
     primary = cfg.metrics.primary
     pd.set_option("display.width", 160, "display.max_columns", 40)
@@ -148,18 +107,10 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 def cmd_sweep(args: argparse.Namespace) -> int:
     """Run each config, then print the holdout comparison table."""
-    from .sweep import run_sweep
-
-    cfgs = []
-    for path in args.configs:
-        cfg = Config.from_yaml(path)
-        if args.data:
-            cfg.data.path = args.data
-        if args.quiet:
-            cfg.run.verbose = 0
-        cfgs.append(cfg)
-
+    cfgs = [apply_overrides(Config.from_yaml(path), data=args.data, quiet=args.quiet)
+            for path in args.configs]
     comparison, _ = run_sweep(cfgs, output_dir=args.output_dir)
+
     pd.set_option("display.width", 200, "display.max_columns", 30)
     cols = [c for c in comparison.columns if c != "features"]
     print("\n--- sweep comparison (ranked on holdout when primaries match) ---")
@@ -173,21 +124,8 @@ def cmd_sweep(args: argparse.Namespace) -> int:
 
 def cmd_score(args: argparse.Namespace) -> int:
     """Load a persisted model and score a file of new records."""
-    from ..inference import ProductionScorer
-
-    reader = pd.read_parquet if str(args.data).endswith(".parquet") else pd.read_csv
-    frame = reader(args.data)
-
-    scorer = ProductionScorer.from_joblib(
-        args.model, threshold=args.threshold, top_pct=args.top_pct
-    )
-    scored, report = scorer.score(frame)
-
-    if args.id_column and args.id_column in frame.columns:
-        scored.insert(0, args.id_column, frame[args.id_column].to_numpy())
-
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    scored.to_csv(args.out, index=False)
+    scorer = ProductionScorer.from_joblib(args.model, threshold=args.threshold, top_pct=args.top_pct)
+    scored, report = score(scorer, args.data, out=args.out, id_column=args.id_column)
 
     print(f"model      : {scorer.metadata.get('model', '(unnamed)')}")
     print(f"variables  : {len(scorer.features)} -> {', '.join(scorer.features)}")

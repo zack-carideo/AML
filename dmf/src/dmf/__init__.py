@@ -30,7 +30,7 @@ Quick start::
 """
 
 from .config import Config, ModelSpec
-from .inference import ProductionScorer, load_scorer
+from .inference import ProductionScorer
 from .metrics import (
     METRIC_REGISTRY,
     decile_table,
@@ -86,7 +86,6 @@ __all__ = [
     "DisputeFeaturePipeline",
     "build_model_pipeline",
     "ProductionScorer",
-    "load_scorer",
     "StepReport",
     "run_lineage",
     "METRIC_REGISTRY",
