@@ -506,6 +506,7 @@ def executive_report(
     # ---------------- at a glance ----------------
     confirm = steps.get("holdout_confirmation", {})
     slices_step = steps.get("holdout_slices", {})
+    sampling = steps.get("training_sampling", {})
     primary = next((k for k in ("average_precision", "roc_auc") if k in holdout), None)
     kpis = [
         _kpi("Holdout AP", holdout.get("average_precision"), "primary metric"),
@@ -520,6 +521,13 @@ def executive_report(
         _kpi("Precision at cut", holdout.get("decision_precision")),
         _kpi("Recall at cut", holdout.get("decision_recall")),
     ]
+    if sampling.get("enabled"):
+        kpis += [
+            _kpi("Training sample rate", sampling.get("sampling_rate"),
+                 f"{_fmt(sampling.get('n_train_fitted'))} of "
+                 f"{_fmt(sampling.get('n_train_available'))} rows"),
+            _kpi("Prevalence shift", sampling.get("prevalence_ratio"), "fitted / source"),
+        ]
     body.append("<div class='kpis'>" + "".join(kpis) + "</div>")
 
     cal = holdout.get("calibration_ratio")
@@ -530,6 +538,27 @@ def executive_report(
             f"(ratio {_fmt(cal, 2)}, ECE {_fmt(holdout.get('calibration_error'))}). Ranking and the "
             f"capacity cut are unaffected; any use that multiplies score by exposure needs a "
             f"post-hoc calibrator first.</div>"
+        )
+
+    # placed next to the calibration note on purpose: when sampling is on, it is
+    # a large part of why that note is there
+    if sampling.get("prior_shifted"):
+        body.append(
+            f"<div class='note'><b>Training rows were undersampled.</b> The model was fitted "
+            f"on {_fmt(sampling.get('n_train_fitted'))} of "
+            f"{_fmt(sampling.get('n_train_available'))} available rows "
+            f"(rate {_fmt(sampling.get('sampling_rate'))}), moving the training prevalence "
+            f"from {_fmt(sampling.get('train_prevalence_available'))} to "
+            f"{_fmt(sampling.get('train_prevalence_fitted'))} — a log-odds shift of "
+            f"{_fmt(sampling.get('prior_shift_logit'))}. Validation folds and the holdout "
+            f"kept every row, so the metrics above remain out-of-sample measurements on the "
+            f"full population; the predicted <i>scores</i>, however, are raised throughout "
+            f"and are not probabilities on the source population. A calibrator for them must "
+            f"be fitted on unsampled rows."
+            + (f" Coverage retained: {_fmt(sampling.get('coverage_retained_categorical'))} of "
+               f"categorical levels, {_fmt(sampling.get('coverage_retained_numeric'))} of "
+               f"numeric range." if sampling.get("coverage_retained_categorical") is not None else "")
+            + "</div>"
         )
 
     # ---------------- narrative sections from the manifest ----------------

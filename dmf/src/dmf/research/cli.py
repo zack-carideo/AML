@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--metric", default=None, help="Override metrics.primary.")
     t.add_argument("--tune", action="store_true", help="Enable hyper-parameter tuning.")
     t.add_argument("--no-tune", action="store_true", help="Disable hyper-parameter tuning.")
+    t.add_argument("--no-sampling", action="store_true",
+                   help="Disable training-row undersampling (the A/B against a sampled config).")
     t.add_argument("--n-jobs", type=int, default=None, help="Override run.n_jobs.")
     t.add_argument("--seed", type=int, default=None, help="Override run.random_state.")
     t.add_argument("--quiet", action="store_true", help="Suppress the step report.")

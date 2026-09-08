@@ -33,6 +33,12 @@ COMPARABILITY_KEYS = [
     "split.cv.n_splits",
     "split.cv.n_repeats",
     "data.path",
+    # a sampled run and an unsampled one were fit on different populations
+    "sampling.enabled",
+    "sampling.purpose",
+    "sampling.negative_positive_ratio",
+    "sampling.max_rows",
+    "sampling.max_fraction",
 ]
 
 

@@ -23,6 +23,13 @@ from .evaluate import (
     threshold_at_fpr,
 )
 from .ordering import aggregate_to_source, importance_ordering, rank_variables, rfe_ordering
+from .sampling import (
+    SampleResult,
+    UndersampledSplit,
+    coverage_sample,
+    coverage_score,
+    resolve_sampling_columns,
+)
 from .selection import ModelSelectionHarness, SelectionResult
 from .sweep import check_comparability, run_sweep
 from .zoo import build_estimator, build_zoo, config_for_model, import_object
@@ -45,6 +52,11 @@ __all__ = [
     "importance_ordering",
     "rfe_ordering",
     "aggregate_to_source",
+    "SampleResult",
+    "UndersampledSplit",
+    "coverage_sample",
+    "coverage_score",
+    "resolve_sampling_columns",
     "build_estimator",
     "build_zoo",
     "config_for_model",

@@ -170,6 +170,60 @@ split:
     n_repeats: 1                       # >1 switches to RepeatedStratifiedKFold
     shuffle: true
 
+# ---------------------------------------------------------------------------
+# -- coverage-maximizing undersampling --------------------------------------
+# Reduces the rows a model is *fitted* on -- either to rebalance a low-prevalence
+# target, or to keep a wide grid feasible on a large table. Validation folds, the
+# holdout, and the inner scoring folds of a hyper-parameter search always keep
+# every row, so every reported metric stays an out-of-sample measurement on the
+# full population.
+#
+# Rows are chosen rather than drawn at random: strata are formed from the
+# categoricals below, k-means runs on the raw numerics inside each stratum, and
+# every stratum and cluster is guaranteed at least one row. That is what keeps
+# sparse corners of the feature space represented.
+#
+# It shifts the class prior, and the framework does NOT correct for it -- the
+# usual logit offset is valid only for uniform undersampling, and this sampler
+# deliberately draws denser from sparse clusters. Scores stay usable for ranking
+# and for the capacity cut; anything multiplying score by exposure needs a
+# calibrator fitted on unsampled rows. The run report says so.
+#
+# cluster_allocation, measured against naive random undersampling (9k rows,
+# ~25 dimensions): the gain is in the TAIL, not the average -- it removes
+# unrepresented regions rather than improving mean density, and spread trades
+# off against generalization.
+#   sqrt         ~ +4% p95 coverage, ~+10% worst gap, ~-0.009 AP   (default)
+#   proportional ~ +3% p95 coverage, ~+5%  worst gap, ~-0.003 AP   (close to random)
+#   equal        ~ +5% p95 coverage, ~+14% worst gap, ~-0.024 AP   (widest spread)
+sampling:
+  enabled: false
+  purpose: compute                     # compute | rebalance | both
+  strategy: stratified_cluster         # stratified_cluster | random
+  apply_to: all                        # all | cv_only
+  # budget -- rebalance needs the ratio; compute needs exactly one cap
+  negative_positive_ratio: null        # e.g. 3.0 -> keep 3 negatives per positive
+  max_rows: null                       # e.g. 50000
+  max_fraction: null                   # e.g. 0.25
+  sample_classes: negative             # negative | both  ('both' preserves the prior)
+  # Name these explicitly on real data: inheriting every categorical picks up
+  # identifier-like columns (merchant_id) and yields one stratum per level.
+  stratify_columns: []                 # [] -> the inferred categoricals
+  max_strata: 50
+  min_stratum_rows: 30
+  cluster_columns: []                  # [] -> the inferred numerics (raw, not encoded)
+  clusters_per_stratum: auto           # auto | integer
+  max_clusters_per_stratum: 20
+  min_cluster_rows: 10
+  cluster_allocation: sqrt             # sqrt | proportional | equal
+  within_cluster: spread               # spread | random
+  kmeans_max_rows: 50000               # above this, MiniBatchKMeans
+  kmeans_n_init: 3
+  min_rows_after: 500                  # never sample below this many rows
+  # Both guards refuse a silently wrong run; set true only deliberately.
+  acknowledge_imbalance_double_correction: false   # sampling + models.*.imbalance
+  acknowledge_uncalibrated: false                  # silences the prior-shift warning
+
 metrics:
   primary: average_precision           # PR-AUC: the right primary under low prevalence
   secondary:

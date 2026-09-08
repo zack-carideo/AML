@@ -283,6 +283,91 @@ class SplitConfig:
 
 
 @dataclass
+class SamplingConfig:
+    """Coverage-maximizing undersampling of the rows a model is *fit* on.
+
+    Two uses, declared by ``purpose``: rebalancing a low-prevalence target, and
+    shrinking a large training population so a wide grid stays feasible.
+
+    Three properties make it safe to switch on:
+
+    * It is **experiment-time only**. Nothing here enters the shipped pipeline;
+      the sampler chooses rows, it does not transform them.
+    * It applies **only to fitting halves**. Every validation fold, the holdout,
+      and the inner scoring folds of a hyper-parameter search keep every row.
+      Because ``search.fit`` owns its inner split, the only correct way to reach
+      it is a CV wrapper that shrinks each fold's *train* index -- resampling the
+      training partition beforehand would corrupt every inner validation fold.
+    * It **shifts the class prior**, and the framework does not correct for it.
+      The usual global logit offset ``logit(p) - log(rate)`` is valid only for
+      *uniform* undersampling; this sampler deliberately draws denser from sparse
+      clusters, so the effective rate varies across the feature space and no
+      scalar offset restores calibration. Scores stay usable for ranking and for
+      the capacity cut; anything that multiplies score by exposure needs a
+      calibrator fit on unsampled rows. The run report says so, loudly.
+
+    Two double-correction traps are refused at config load: an active
+    ``models[*].imbalance`` policy alongside a prior-shifting sample, and a
+    sample that would leave too few positives for stratified CV.
+    """
+
+    enabled: bool = False
+    purpose: str = "compute"                 # compute | rebalance | both
+    strategy: str = "stratified_cluster"     # stratified_cluster | random
+    apply_to: str = "all"                    # all | cv_only
+    # Budget. The grammar depends on `purpose` and is enforced in validate():
+    # rebalance needs the ratio and forbids the caps; compute needs exactly one
+    # cap and forbids the ratio; both needs the ratio and exactly one cap.
+    negative_positive_ratio: Optional[float] = None   # rebalance | both
+    max_rows: Optional[int] = None                    # compute | both
+    max_fraction: Optional[float] = None              # compute | both
+    # 'negative' keeps every positive row verbatim -- the usual choice. 'both'
+    # samples each class independently, which preserves the prior and is the
+    # only combination that does NOT trip the calibration and imbalance guards.
+    sample_classes: str = "negative"         # negative | both
+    # Strata are formed from these columns; [] resolves to the inferred
+    # categoricals. Name them explicitly on real data -- inheriting every
+    # categorical picks up identifier-like columns and produces one stratum per
+    # customer, which defeats the point.
+    stratify_columns: List[str] = field(default_factory=list)
+    max_strata: int = 50
+    min_stratum_rows: int = 30
+    # k-means runs on these RAW numeric columns; [] resolves to the inferred
+    # numerics. Raw, not encoded: the fold's encoders are fit on the rows this
+    # sampler is still choosing, so encoding first would be circular.
+    cluster_columns: List[str] = field(default_factory=list)
+    clusters_per_stratum: Any = "auto"       # "auto" | int
+    max_clusters_per_stratum: int = 20
+    min_cluster_rows: int = 10
+    # How a stratum's budget is divided across its clusters. Measured on a
+    # 9k-row, ~25-dimension sample against naive random undersampling: sqrt
+    # closes ~37% of the worst coverage gap for ~0.009 AP; proportional closes
+    # ~31% for ~0.003 but is otherwise statistically close to random (drawing in
+    # proportion to cluster size reproduces the original density); equal closes
+    # ~50% for ~0.024 AP. Spread and generalization trade off -- pick knowingly.
+    cluster_allocation: str = "sqrt"         # sqrt | proportional | equal
+    # 'spread' takes rows evenly along the distance-to-centroid ranking, so a
+    # cluster contributes centre, mid-shell and boundary rows.
+    within_cluster: str = "spread"           # spread | random
+    kmeans_max_rows: int = 50_000            # above this -> MiniBatchKMeans
+    kmeans_n_init: int = 3
+    min_rows_after: int = 500                # never sample below this
+    acknowledge_imbalance_double_correction: bool = False
+    acknowledge_uncalibrated: bool = False
+
+    @property
+    def shifts_prior(self) -> bool:
+        """True when the sample changes P(y=1) relative to the source population.
+
+        Sampling both classes proportionally for compute reasons leaves the
+        prior intact; every other combination moves it. Both safety guards key
+        off this rather than off ``enabled``.
+        """
+        return self.enabled and not (self.purpose == "compute"
+                                     and self.sample_classes == "both")
+
+
+@dataclass
 class MetricsConfig:
     primary: str = "average_precision"
     secondary: List[str] = field(
@@ -403,6 +488,7 @@ class Config:
     columns: ColumnsConfig = field(default_factory=ColumnsConfig)
     preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
+    sampling: SamplingConfig = field(default_factory=SamplingConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     selection: SelectionConfig = field(default_factory=SelectionConfig)
     models: Dict[str, ModelSpec] = field(default_factory=dict)
@@ -460,8 +546,16 @@ class Config:
             (self.run.save_predictions, {"none", "holdout", "cv", "all"}, "run.save_predictions"),
             (self.metrics.decision_threshold_policy, {"top_pct", "fpr", "none"},
              "metrics.decision_threshold_policy"),
+            (self.sampling.purpose, {"compute", "rebalance", "both"}, "sampling.purpose"),
+            (self.sampling.strategy, {"stratified_cluster", "random"}, "sampling.strategy"),
+            (self.sampling.apply_to, {"all", "cv_only"}, "sampling.apply_to"),
+            (self.sampling.sample_classes, {"negative", "both"}, "sampling.sample_classes"),
+            (self.sampling.cluster_allocation, {"sqrt", "proportional", "equal"},
+             "sampling.cluster_allocation"),
+            (self.sampling.within_cluster, {"spread", "random"}, "sampling.within_cluster"),
         ]:
             _check_in(value, allowed, where)
+        self._validate_sampling()
         if g.numeric_tolerance < 0:
             raise ValueError("preprocessing.inference_guard.numeric_tolerance must be >= 0.")
         # an unknown metric name, a bad operating point, or a primary that spans
@@ -513,6 +607,89 @@ class Config:
         if self.models and not any(m.enabled for m in self.models.values()):
             raise ValueError("No enabled models in the estimator zoo.")
 
+    def _validate_sampling(self) -> None:
+        """Budget grammar, ranges, and the two double-correction guards.
+
+        Everything is skipped when sampling is disabled, so a stale block in a
+        config never blocks a run that does not use it.
+        """
+        s = self.sampling
+        if not s.enabled:
+            return
+
+        caps = [s.max_rows, s.max_fraction]
+        n_caps = sum(c is not None for c in caps)
+        if s.purpose in ("compute", "both") and n_caps != 1:
+            raise ValueError(
+                f"exactly one of sampling.max_rows or sampling.max_fraction must be set "
+                f"when sampling.purpose='{s.purpose}'; got {n_caps}."
+            )
+        if s.purpose == "rebalance" and n_caps:
+            raise ValueError(
+                "sampling.max_rows / sampling.max_fraction do not apply when "
+                "sampling.purpose='rebalance'; the budget is negative_positive_ratio."
+            )
+        if s.purpose in ("rebalance", "both") and s.negative_positive_ratio is None:
+            raise ValueError(
+                f"sampling.negative_positive_ratio is required when "
+                f"sampling.purpose='{s.purpose}'."
+            )
+        if s.purpose == "compute" and s.negative_positive_ratio is not None:
+            raise ValueError(
+                "sampling.negative_positive_ratio does not apply when "
+                "sampling.purpose='compute'; use max_rows or max_fraction."
+            )
+
+        if s.negative_positive_ratio is not None and s.negative_positive_ratio <= 0:
+            raise ValueError("sampling.negative_positive_ratio must be > 0.")
+        if s.max_fraction is not None and not 0.0 < s.max_fraction <= 1.0:
+            raise ValueError("sampling.max_fraction must be in (0, 1].")
+        if s.max_rows is not None:
+            if s.max_rows < 1:
+                raise ValueError("sampling.max_rows must be >= 1.")
+            if s.max_rows < 2 * self.split.cv.n_splits:
+                raise ValueError(
+                    f"sampling.max_rows={s.max_rows} leaves too few rows for "
+                    f"{self.split.cv.n_splits}-fold stratified CV; must be >= "
+                    f"2 * split.cv.n_splits."
+                )
+        for name, value in (
+            ("max_strata", s.max_strata), ("min_stratum_rows", s.min_stratum_rows),
+            ("min_cluster_rows", s.min_cluster_rows),
+            ("max_clusters_per_stratum", s.max_clusters_per_stratum),
+            ("kmeans_n_init", s.kmeans_n_init), ("min_rows_after", s.min_rows_after),
+            ("kmeans_max_rows", s.kmeans_max_rows),
+        ):
+            if value < 1:
+                raise ValueError(f"sampling.{name} must be >= 1.")
+        if s.clusters_per_stratum != "auto" and not (
+            isinstance(s.clusters_per_stratum, int)
+            and not isinstance(s.clusters_per_stratum, bool)
+            and s.clusters_per_stratum >= 1
+        ):
+            raise ValueError(
+                f"sampling.clusters_per_stratum must be 'auto' or an integer >= 1; "
+                f"got {s.clusters_per_stratum!r}."
+            )
+
+        # The prior would be corrected twice: once by dropping negatives, once by
+        # the estimator's own reweighting. Keyed off `imbalance` being truthy and
+        # never off its value -- zoo._imbalance_kwargs routes 'balanced' to
+        # scale_pos_weight whenever the class has no class_weight parameter, so
+        # the declared value does not tell you which branch fires.
+        if s.shifts_prior:
+            offenders = sorted(n for n, m in self.enabled_models.items() if m.imbalance)
+            if offenders and not s.acknowledge_imbalance_double_correction:
+                raise ValueError(
+                    f"sampling shifts the class prior and models {offenders} also declare "
+                    f"an 'imbalance' policy; the prior would be corrected twice. Note that "
+                    f"imbalance='balanced' on an estimator without class_weight (XGBoost) "
+                    f"becomes scale_pos_weight, which is computed once from the unsampled "
+                    f"training labels and cloned into every fold. Remove models.*.imbalance, "
+                    f"or set sampling.acknowledge_imbalance_double_correction: true to have "
+                    f"it recomputed from the sampled rows and both values reported."
+                )
+
     # ---------------- convenience ----------------
     @property
     def enabled_models(self) -> Dict[str, ModelSpec]:
@@ -532,6 +709,6 @@ __all__ = [
     "Config", "RunConfig", "DataConfig", "ColumnsConfig", "PreprocessingConfig",
     "InferenceGuardConfig",
     "NumericPreprocessing", "CategoricalPreprocessing", "SplitConfig", "CVConfig",
-    "MetricsConfig", "SelectionConfig", "ModelSpec", "TuningConfig",
+    "MetricsConfig", "SamplingConfig", "SelectionConfig", "ModelSpec", "TuningConfig",
     "get_dotted", "set_dotted",
 ]

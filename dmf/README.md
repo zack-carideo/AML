@@ -28,7 +28,7 @@ python examples/generate_synthetic_disputes.py       # writes data/disputes.csv
 dmf train --config configs/dispute_fraud.yaml        # or: python -m dmf.research.cli train ...
 python examples/run_demo.py                          # narrated end-to-end walkthrough
 python examples/edge_case_audit.py                   # ten production failure modes
-pytest -q                                            # 140 tests
+pytest -q                                            # 169 tests
 ```
 
 `examples/research_walkthrough.ipynb` is the same material as a model-documentation spec
@@ -293,6 +293,63 @@ had scored terribly on a segment where nothing was measurable.
 
 Group and time keys are automatically excluded from the candidate variables.
 
+## Undersampling the training rows
+
+Off by default. `sampling` reduces the rows a model is **fitted** on — either to
+rebalance a low-prevalence target (`purpose: rebalance`) or to keep a wide grid feasible
+on a large table (`purpose: compute`). Validation folds, the holdout, and the inner
+scoring folds of a hyper-parameter search always keep every row, so every reported metric
+remains an out-of-sample measurement on the full population.
+
+Rows are chosen rather than drawn at random: strata are formed from the declared
+categoricals, k-means runs on the **raw** numerics inside each stratum, and every stratum
+and every cluster is guaranteed at least one row. Raw rather than encoded is deliberate —
+the fold's encoders are fitted on the rows the sampler is still choosing, so encoding
+first would be circular. `within_cluster: spread` then walks each cluster's
+distance-to-centroid ranking at even intervals, contributing its centre, mid-shell and
+boundary rather than a random handful.
+
+`cluster_allocation` is the spread/generalization dial. Measured against naive random
+undersampling (9k rows, ~25 dimensions, five seeds):
+
+| allocation | p95 coverage | worst gap | holdout AP |
+|---|---|---|---|
+| `proportional` | +3% | +5% | −0.003 |
+| `sqrt` *(default)* | +4% | +10% | −0.009 |
+| `equal` | +5% | +14% | −0.024 |
+
+Two things that table makes concrete. The gain is in the **tail**, not the average — no
+allocation rule moves mean nearest-neighbour distance by more than ~1%; what it removes is
+*unrepresented regions*. And spread trades against generalization: proportional allocation
+is statistically close to random undersampling, while equal allocation buys the widest
+coverage at the largest AP cost. `sqrt` is the default because it closes most of the gap
+for a third of the cost.
+
+**It shifts the class prior and the framework does not correct for it.** The usual global
+logit offset is valid only for *uniform* undersampling; this sampler deliberately draws
+denser from sparse clusters, so the effective rate varies across the feature space and no
+scalar offset restores calibration. Ranking, AP, ROC-AUC and lift are unaffected; anything
+that multiplies score by exposure needs a calibrator fitted on unsampled rows. The run
+report records the shift and the executive report states it in prose.
+
+Two double-corrections are refused at config load rather than discovered later:
+
+- **sampling + `models[*].imbalance`** — dropping negatives and reweighting corrects the
+  prior twice. Set `acknowledge_imbalance_double_correction: true` to proceed, and
+  `scale_pos_weight` is then recomputed from the sampled rows (it is otherwise derived
+  once from the full partition and frozen into the estimator). Note that
+  `imbalance: balanced` on an estimator without `class_weight` silently becomes
+  `scale_pos_weight`, so the guard keys off the field being set, not its value.
+- **a sample too thin for stratified CV** — checked against `split.cv.n_splits`.
+
+`stratify_columns: []` inherits the inferred categoricals, tried lowest-cardinality first
+so the most columns fit under `max_strata`. Name them explicitly on real data: on the
+shipped example that lifts categorical coverage from 0.95 to 1.0, because the inherited
+list spends its budget on integer-coded count columns before reaching `customer_segment`.
+
+`--no-sampling` on `dmf train` forces it off, which makes the "did sampling hurt?" A/B one
+word. A sampled and an unsampled run are stamped `comparable: false` in a sweep.
+
 ## Hyper-parameter tuning
 
 Off by default: selection is about *which variables and which architecture*; tuning is a
@@ -494,6 +551,7 @@ src/dmf/                      PRODUCTION CORE — what the scoring path executes
 src/dmf/research/             EXPERIMENT SIDE — imports the core, never the reverse
   selection.py                ModelSelectionHarness, paired tests, artifacts
   ordering.py                 importance / rfe, fold-nested
+  sampling.py                 coverage-maximizing undersampling of fitting halves
   evaluate.py                 prediction store, post-run metric recomputation
   api.py                      functional CLI equivalents returning objects
   sweep.py                    multi-config runs, comparability check
@@ -502,7 +560,7 @@ src/dmf/research/             EXPERIMENT SIDE — imports the core, never the re
 
 configs/                      dispute_fraud.yaml, dispute_fraud_v2.yaml
 examples/                     data generator, demo, edge-case audit, research notebook
-tests/                        140 tests
+tests/                        169 tests
 ```
 
 `Config` lives in the core even though it carries the experiment sections (`selection`,

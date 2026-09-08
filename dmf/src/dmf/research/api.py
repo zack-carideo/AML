@@ -35,7 +35,7 @@ OVERRIDES = {
     "seed": "run.random_state",
 }
 #: keywords whose value needs interpreting rather than assigning
-_FLAGS = {"data", "distinct_models", "tune", "no_tune", "quiet"}
+_FLAGS = {"data", "distinct_models", "tune", "no_tune", "quiet", "no_sampling"}
 #: every keyword train() and the CLI accept
 TRAIN_OVERRIDES = set(OVERRIDES) | _FLAGS
 
@@ -62,6 +62,8 @@ def apply_overrides(cfg: Config, **overrides: Any) -> Config:
         cfg.tuning.enabled = True
     if overrides.get("no_tune"):
         cfg.tuning.enabled = False
+    if overrides.get("no_sampling"):
+        cfg.sampling.enabled = False
     if overrides.get("quiet"):
         cfg.run.verbose = 0
     cfg.validate()

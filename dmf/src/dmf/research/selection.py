@@ -27,6 +27,7 @@ from __future__ import annotations
 import itertools
 import json
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -64,7 +65,17 @@ from ..reporting import StepReport, json_safe, run_lineage, summarize_frame, sum
 from ..transformers import infer_roles
 from .evaluate import PredictionLog, implied_thresholds, write_prediction_artifacts
 from .ordering import rank_variables
+from .sampling import SampleResult, UndersampledSplit, coverage_sample, fold_seed
 from .zoo import build_zoo
+
+# Seed offsets, so no two sampled populations share a k-means initialisation.
+# The grid and the tuned re-score deliberately share _SEED_FOLD: their fitting
+# halves must be identical row-for-row or the tuning delta measures the sampler
+# rather than the hyper-parameters.
+_SEED_FOLD = 10_000
+_SEED_INNER = 20_000
+_SEED_REFERENCE = 30_000
+_SEED_REFIT = 40_000
 
 
 @dataclass
@@ -108,6 +119,10 @@ class ModelSelectionHarness:
         self.config = config
         self.report = StepReport(run=config.run.name)
         self.groups_tr_: Optional[np.ndarray] = None
+        self.roles_: Any = None
+        # the one sample of the whole training partition; reused by the variable
+        # orderings, the champion fit, and the scale_pos_weight derivation
+        self.sample_ref_: Optional[SampleResult] = None
         self.predictions_ = PredictionLog(config.run.save_predictions)
         self.row_ids_: Optional[np.ndarray] = None
         self.row_ids_tr_: Optional[np.ndarray] = None
@@ -126,6 +141,7 @@ class ModelSelectionHarness:
         X_tr, X_ho, y_tr, y_ho = self._split(X, y)
         candidates = self._candidate_variables(X_tr)
 
+        self._prepare_sampling(X_tr, y_tr)
         zoo = self._instantiate_zoo(y_tr)
         orderings = self._compute_orderings(X_tr, y_tr, zoo, candidates)
         leaderboard, fold_scores = self._evaluate_grid(X_tr, y_tr, zoo, orderings, candidates)
@@ -338,6 +354,7 @@ class ModelSelectionHarness:
             c for c in (cfg.split.group_column, cfg.split.time_column) if c
         ]
         roles = infer_roles(X, scoped)
+        self.roles_ = roles          # reused by the sampler, so typing happens once
         candidates = roles.all
         if not candidates:
             raise ValueError(
@@ -394,10 +411,119 @@ class ModelSelectionHarness:
         )
 
     # ------------------------------------------------------------------
+    # step 1b: training-row sampling
+    # ------------------------------------------------------------------
+    def _prepare_sampling(self, X_tr: pd.DataFrame, y_tr: np.ndarray) -> None:
+        """Take the reference sample of the training partition and report it.
+
+        Runs before the zoo so ``scale_pos_weight`` can be derived from the rows
+        that will actually be fit, and before the orderings so they rank on the
+        same population the champion is fit on.
+        """
+        cfg = self.config
+        self.sample_ref_ = coverage_sample(
+            X_tr, y_tr, cfg, seed=fold_seed(cfg, _SEED_REFERENCE), roles=self.roles_
+        )
+        if not cfg.sampling.enabled:
+            return
+
+        d = self.sample_ref_.diagnostics
+        imbalance_active = sorted(n for n, m in cfg.enabled_models.items() if m.imbalance)
+        prior_shifted = bool(cfg.sampling.shifts_prior and d.get("applied"))
+        uncalibrated = bool(prior_shifted and not cfg.sampling.acknowledge_uncalibrated)
+        n_avail, n_fit = d["n_rows_in"], d["n_rows_out"]
+
+        self.report.add(
+            "training_sampling",
+            enabled=True,
+            strategy=cfg.sampling.strategy,
+            purpose=cfg.sampling.purpose,
+            apply_to=cfg.sampling.apply_to,
+            cluster_allocation=cfg.sampling.cluster_allocation,
+            within_cluster=cfg.sampling.within_cluster,
+            n_train_available=n_avail,
+            n_train_fitted=n_fit,
+            sampling_rate=d.get("sampling_rate"),
+            n_train_positive_available=d["n_positive_in"],
+            n_train_positive_fitted=d["n_positive_out"],
+            train_prevalence_available=d.get("prevalence_in"),
+            train_prevalence_fitted=d.get("prevalence_out"),
+            prevalence_ratio=d.get("prevalence_ratio"),
+            prior_shift_logit=d.get("prior_shift_logit"),
+            n_strata=d.get("n_strata"),
+            n_strata_collapsed=d.get("n_strata_collapsed"),
+            n_clusters_total=d.get("n_clusters_total"),
+            n_singleton_clusters=d.get("n_singleton_clusters"),
+            n_strata_cluster_fallback=d.get("n_strata_cluster_fallback"),
+            stratify_columns=d.get("stratify_columns_used"),
+            cluster_columns=d.get("cluster_columns_used"),
+            coverage_retained_categorical=d.get("coverage_retained_categorical"),
+            coverage_retained_numeric=d.get("coverage_retained_numeric"),
+            mean_nn_distance=d.get("mean_nn_distance"),
+            p95_nn_distance=d.get("p95_nn_distance"),
+            max_nn_distance=d.get("max_nn_distance"),
+            n_positive_per_fitted_fold=round(
+                d["n_positive_out"] * (1 - 1 / cfg.split.cv.n_splits) / 1.0, 1
+            ),
+            imbalance_policies_active=imbalance_active,
+            degraded_reason=d.get("degraded_reason"),
+            sampling_seconds=d.get("sampling_seconds"),
+            # explicit risk flags, in the style of thin_positive_folds
+            prior_shifted=prior_shifted,
+            uncalibrated_prior_shift=uncalibrated,
+            double_corrected_imbalance=bool(prior_shifted and imbalance_active),
+            holdout_untouched=True,
+            overfit_gap_basis="sampled_fit_half" if d.get("applied") else "full_fit_half",
+            note="validation folds and the holdout keep every row; only fitting halves "
+                 "are sampled. Predicted scores are NOT probabilities on the source "
+                 "population -- undersampling raises every one of them and the decision "
+                 "threshold derived from them. Ranking, AP, ROC-AUC and lift are "
+                 "unaffected; any use that multiplies score by exposure needs a "
+                 "calibrator fitted on UNSAMPLED rows.",
+        )
+        if uncalibrated:
+            warnings.warn(
+                f"sampling shifted the training prior from {d.get('prevalence_in')} to "
+                f"{d.get('prevalence_out')}; predicted scores are not probabilities on the "
+                f"source population. Wrap result.fitted_model in CalibratedClassifierCV "
+                f"(fitted on unsampled rows) before using them as probabilities, or set "
+                f"sampling.acknowledge_uncalibrated: true to silence this.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    def _fit_rows(self, X, y, ids, idx, *, base: int, index: int = 0):
+        """``(X, y, ids)`` restricted to the rows a model will actually be fit on.
+
+        ``idx`` selects a population out of the training partition (a CV fold's
+        train half, say); the sampler then chooses within it. Returns the three
+        arrays still positionally parallel, which is what keeps
+        ``PredictionLog.add`` aligned.
+        """
+        Xp, yp, idp = X.iloc[idx], y[idx], ids[idx]
+        if not self.config.sampling.enabled:
+            return Xp, yp, idp
+        res = coverage_sample(Xp, yp, self.config,
+                              seed=fold_seed(self.config, base, index), roles=self.roles_)
+        keep = res.indices
+        return Xp.iloc[keep], yp[keep], idp[keep]
+
+    # ------------------------------------------------------------------
     # step 2: zoo + orderings
     # ------------------------------------------------------------------
     def _instantiate_zoo(self, y_tr: np.ndarray) -> Dict[str, Dict[str, Any]]:
-        zoo, skipped = build_zoo(self.config, y_tr)
+        # scale_pos_weight is neg/pos computed once here and frozen into the
+        # estimator, so when sampling shifts the prior it must be derived from
+        # the rows that will actually be fit -- otherwise the estimator corrects
+        # for an imbalance that no longer exists. class_weight='balanced' needs
+        # no such care: sklearn recomputes it per fit.
+        y_for_weights = y_tr
+        if self.sample_ref_ is not None and self.config.sampling.shifts_prior:
+            y_for_weights = y_tr[self.sample_ref_.indices]
+        zoo, skipped = build_zoo(self.config, y_for_weights)
+        weights = {n: e["estimator"].get_params().get("scale_pos_weight")
+                   for n, e in zoo.items()}
+        weights = {n: v for n, v in weights.items() if v is not None}
         for entry in zoo.values():
             # A validation fold routinely contains category levels the training
             # folds did not, so guard warnings during the sweep are noise. The
@@ -410,6 +536,12 @@ class ModelSelectionHarness:
             tags={k: v["spec"].tag for k, v in zoo.items()},
             n_skipped=len(skipped),
             skipped=skipped,
+            # neg/pos as frozen into each estimator. Under sampling this is
+            # derived from the sampled rows, so it corrects the imbalance the
+            # model will actually see rather than the one in the raw partition.
+            scale_pos_weight=weights or None,
+            scale_pos_weight_basis=("sampled_rows" if y_for_weights is not y_tr
+                                    else "full_training_partition"),
         )
         return zoo
 
@@ -417,6 +549,12 @@ class ModelSelectionHarness:
         cfg = self.config
         ref = cfg.selection.ordering_reference_model
         orderings: Dict[str, Any] = {}
+
+        # rank on the rows the champion will be fit on, so the reported variable
+        # list is produced by the same procedure that produces the shipped model
+        if cfg.sampling.enabled and cfg.sampling.apply_to == "all" and self.sample_ref_ is not None:
+            keep = self.sample_ref_.indices
+            X_tr, y_tr = X_tr.iloc[keep], y_tr[keep]
 
         if ref != "per_model":
             entry = zoo.get(ref)
@@ -521,9 +659,13 @@ class ModelSelectionHarness:
         for f, (tr_idx, va_idx) in enumerate(cv.split(X_tr, y_tr, self.groups_tr_)):
             n_folds += 1
             repeat, fold = divmod(f, cfg.split.cv.n_splits)
-            Xf, yf = X_tr.iloc[tr_idx], y_tr[tr_idx]
-            Xv, yv = X_tr.iloc[va_idx], y_tr[va_idx]
-            ids_f, ids_v = self.row_ids_tr_[tr_idx], self.row_ids_tr_[va_idx]
+            # The fitting half is sampled once per fold and reused by every model
+            # and every k: the sampler takes no estimator, so a per-model call
+            # would repeat identical work (~2s each) for identical rows.
+            Xf, yf, ids_f = self._fit_rows(X_tr, y_tr, self.row_ids_tr_, tr_idx,
+                                           base=_SEED_FOLD, index=f)
+            Xv, yv = X_tr.iloc[va_idx], y_tr[va_idx]          # never sampled
+            ids_v = self.row_ids_tr_[va_idx]
             self.predictions_.add_fold(fold, repeat, ids_v)
 
             for model_name, entry in zoo.items():
@@ -792,6 +934,13 @@ class ModelSelectionHarness:
         pool = leaderboard.sort_values(mean_col, ascending=asc, kind="mergesort")
         targets = pool if cfg.tuning.apply_to == "all" else pool.head(cfg.selection.top_n)
         inner = self._cv(n_splits=cfg.tuning.cv_splits, seed_offset=1)
+        # The search owns its inner split, so the only way to sample inside it
+        # without shrinking what it is scored on is to wrap the splitter and
+        # replace each fold's train index. Resampling X_tr before search.fit
+        # would resample every inner validation fold too.
+        if cfg.sampling.enabled:
+            inner = UndersampledSplit(inner, X_tr, y_tr, cfg,
+                                      seed=fold_seed(cfg, _SEED_INNER))
         outer = self._cv()
         new_rows, tuned_summary = [], []
 
@@ -848,6 +997,8 @@ class ModelSelectionHarness:
             strategy=cfg.tuning.strategy,
             n_iter=cfg.tuning.n_iter,
             n_specs_tuned=len(tuned_summary),
+            inner_sampling_rate=(inner.mean_sampling_rate
+                                 if isinstance(inner, UndersampledSplit) else None),
             mean_improvement=round(float(np.mean([t["delta"] for t in tuned_summary])), 6)
             if tuned_summary else None,
             detail=tuned_summary,
@@ -864,10 +1015,15 @@ class ModelSelectionHarness:
         cell: Dict[str, List[float]] = {"fit_time": []}
         for f, (tr_idx, va_idx) in enumerate(cv.split(X_tr, y_tr, self.groups_tr_)):
             repeat, fold = divmod(f, self.config.split.cv.n_splits)
+            # same base seed and fold index as the grid, so a tuned row's fitting
+            # half is identical to its baseline's -- otherwise the tuning delta
+            # would measure the sampler rather than the hyper-parameters
+            Xf, yf, ids_f = self._fit_rows(X_tr, y_tr, self.row_ids_tr_, tr_idx,
+                                           base=_SEED_FOLD, index=f)
             self._score_cell(cell, make_pipe(),
-                             X_tr.iloc[tr_idx], y_tr[tr_idx],
+                             Xf, yf,
                              X_tr.iloc[va_idx], y_tr[va_idx],
-                             self.row_ids_tr_[tr_idx], self.row_ids_tr_[va_idx],
+                             ids_f, self.row_ids_tr_[va_idx],
                              model_name, k, fold, repeat)
         return {key: np.asarray(vals, dtype=float) for key, vals in cell.items()}
 
@@ -880,7 +1036,14 @@ class ModelSelectionHarness:
         features = selected["features"]
 
         pipe = build_model_pipeline(entry["config"], features, entry["estimator"])
-        pipe.fit(X_tr, y_tr)
+        # the champion is fit on the sampled rows; X_ho below is never sampled,
+        # so every holdout number remains an out-of-sample measurement on the
+        # full population
+        X_fit, y_fit = X_tr, y_tr
+        if cfg.sampling.enabled and cfg.sampling.apply_to == "all" and self.sample_ref_ is not None:
+            keep = self.sample_ref_.indices
+            X_fit, y_fit = X_tr.iloc[keep], y_tr[keep]
+        pipe.fit(X_fit, y_fit)
         proba = pipe.predict_proba(X_ho)[:, 1]
         holdout = evaluate_predictions(y_ho, proba, cfg.metrics)
         deciles = decile_table(y_ho, proba)
@@ -917,16 +1080,25 @@ class ModelSelectionHarness:
         prod_cfg.preprocessing.inference_guard.warn = cfg.preprocessing.inference_guard.warn
         if cfg.run.refit_on_full_data:
             final = build_model_pipeline(prod_cfg, features, entry["estimator"])
-            final.fit(X_all, y_all)
+            # train+holdout is its own population, so it gets its own sample
+            X_refit, y_refit = X_all, y_all
+            if cfg.sampling.enabled and cfg.sampling.apply_to == "all":
+                res = coverage_sample(X_all, y_all, cfg, seed=fold_seed(cfg, _SEED_REFIT))
+                X_refit, y_refit = X_all.iloc[res.indices], y_all[res.indices]
+            final.fit(X_refit, y_refit)
             refit_info: Dict[str, Any] = dict(
                 refit_on="train+holdout",
+                # n_rows keeps meaning "rows available"; n_rows_fitted is what
+                # the model actually saw, so no existing key changes meaning
                 n_rows=len(X_all),
+                n_rows_fitted=len(X_refit),
+                sampling_rate=round(len(X_refit) / len(X_all), 6) if len(X_all) else None,
                 n_variables=len(features),
                 n_design_columns=len(final.named_steps["features"].feature_names_out_),
             )
         else:
             final = pipe
-            refit_info = dict(refit_on="train_only", n_rows=len(X_tr))
+            refit_info = dict(refit_on="train_only", n_rows=len(X_tr), n_rows_fitted=len(X_fit))
 
         # Everything that ships beside the model must describe the model that
         # ships. The holdout numbers above are the *validated* evidence and stay
