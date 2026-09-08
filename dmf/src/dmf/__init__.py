@@ -45,7 +45,7 @@ from .metrics import (
     resolve_metrics,
 )
 from .pipeline import DisputeFeaturePipeline, build_model_pipeline
-from .reporting import StepReport, run_lineage
+from .reporting import StepReport, executive_report, run_lineage
 from .transformers import (
     ROW_FLAG_COLUMNS,
     FrameSelector,
@@ -88,6 +88,7 @@ __all__ = [
     "ProductionScorer",
     "StepReport",
     "run_lineage",
+    "executive_report",
     "METRIC_REGISTRY",
     "make_scorers",
     "metric_names",
